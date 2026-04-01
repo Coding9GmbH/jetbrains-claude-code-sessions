@@ -10,6 +10,12 @@ enum class SessionState(val displayName: String, val description: String) {
     UNKNOWN("Unknown", "Status could not be determined")
 }
 
+enum class SessionEnvironment(val displayName: String) {
+    JETBRAINS_TERMINAL("JetBrains"),
+    EXTERNAL_TERMINAL("Terminal"),
+    UNKNOWN("Unknown")
+}
+
 data class ClaudeSession(
     val pid: Long,
     val sessionId: String,
@@ -18,7 +24,8 @@ data class ClaudeSession(
     var state: SessionState = SessionState.UNKNOWN,
     var lastActivityAt: Instant = Instant.now(),
     var lastAssistantMessage: String = "",  // last few chars to detect accept prompts
-    var cpuPercent: Double = 0.0
+    var cpuPercent: Double = 0.0,
+    var environment: SessionEnvironment = SessionEnvironment.UNKNOWN
 ) {
     val projectName: String
         get() = cwd.trimEnd('/').split("/").lastOrNull()?.ifEmpty { cwd } ?: cwd
