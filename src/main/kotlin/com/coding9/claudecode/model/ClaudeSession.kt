@@ -25,7 +25,9 @@ data class ClaudeSession(
     var lastActivityAt: Instant = Instant.now(),
     var lastAssistantMessage: String = "",  // last few chars to detect accept prompts
     var cpuPercent: Double = 0.0,
-    var environment: SessionEnvironment = SessionEnvironment.UNKNOWN
+    var environment: SessionEnvironment = SessionEnvironment.UNKNOWN,
+    var contextBytes: Long = 0,       // JSONL file size – proxy for context usage
+    var turnCount: Int = 0            // number of conversation turns
 ) {
     val projectName: String
         get() = cwd.trimEnd('/').split("/").lastOrNull()?.ifEmpty { cwd } ?: cwd
