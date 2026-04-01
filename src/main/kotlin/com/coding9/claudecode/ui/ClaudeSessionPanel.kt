@@ -4,6 +4,7 @@ import com.coding9.claudecode.actions.OpenSessionAction
 import com.coding9.claudecode.actions.RefreshAction
 import com.coding9.claudecode.actions.StartSessionAction
 import com.coding9.claudecode.model.ClaudeSession
+import com.coding9.claudecode.model.SessionEnvironment
 import com.coding9.claudecode.model.SessionState
 import com.coding9.claudecode.services.ClaudeSessionMonitorService
 import com.coding9.claudecode.services.SessionsListener
@@ -76,26 +77,39 @@ class ClaudeSessionPanel(private val project: Project, parentDisposable: Disposa
             selectionModel.selectionMode = ListSelectionModel.SINGLE_SELECTION
             emptyText.text = "No active Claude Code sessions"
 
-            // Column widths
-            columnModel.getColumn(0).apply { minWidth = JBUI.scale(180); preferredWidth = JBUI.scale(200) } // project + badge
-            columnModel.getColumn(1).preferredWidth = JBUI.scale(130) // state
-            columnModel.getColumn(2).preferredWidth = JBUI.scale(210) // last message
-            columnModel.getColumn(3).preferredWidth = JBUI.scale(75)  // duration
-            columnModel.getColumn(4).preferredWidth = JBUI.scale(60)  // started
+            // Column widths: Project | Env | Status | Last message | Duration | Started | Action
+            columnModel.getColumn(0).apply { minWidth = JBUI.scale(160); preferredWidth = JBUI.scale(180) }
+            columnModel.getColumn(1).apply { minWidth = JBUI.scale(80); preferredWidth = JBUI.scale(90); maxWidth = JBUI.scale(100) }
+            columnModel.getColumn(2).preferredWidth = JBUI.scale(120)
+            columnModel.getColumn(3).preferredWidth = JBUI.scale(190)
+            columnModel.getColumn(4).preferredWidth = JBUI.scale(70)
+            columnModel.getColumn(5).preferredWidth = JBUI.scale(55)
+            columnModel.getColumn(6).apply { minWidth = JBUI.scale(70); preferredWidth = JBUI.scale(80); maxWidth = JBUI.scale(90) }
 
             // Custom renderers
             columnModel.getColumn(0).cellRenderer = ProjectBadgeRenderer()
-            columnModel.getColumn(1).cellRenderer = StateTextRenderer()
-            columnModel.getColumn(2).cellRenderer = LastMessageRenderer()
-            columnModel.getColumn(3).cellRenderer = DurationRenderer()
-            columnModel.getColumn(4).cellRenderer = TimeRenderer()
+            columnModel.getColumn(1).cellRenderer = EnvironmentRenderer()
+            columnModel.getColumn(2).cellRenderer = StateTextRenderer()
+            columnModel.getColumn(3).cellRenderer = LastMessageRenderer()
+            columnModel.getColumn(4).cellRenderer = DurationRenderer()
+            columnModel.getColumn(5).cellRenderer = TimeRenderer()
+            columnModel.getColumn(6).cellRenderer = ActionButtonRenderer()
 
-            // Double-click: open session
+            // Mouse listener for clicks and hover
             addMouseListener(object : MouseAdapter() {
                 override fun mouseClicked(e: MouseEvent) {
-                    if (e.clickCount == 2 && e.button == MouseEvent.BUTTON1) {
-                        val row = rowAtPoint(e.point)
-                        if (row >= 0) OpenSessionAction.openSession(project, tableModel.getSession(row))
+                    val row = rowAtPoint(e.point)
+                    val col = columnAtPoint(e.point)
+                    if (row < 0) return
+
+                    // Click on action button column OR double-click anywhere
+                    if (col == 6 || (e.clickCount == 2 && e.button == MouseEvent.BUTTON1)) {
+                        val session = tableModel.getSession(row)
+                        if (session.state == SessionState.FINISHED) {
+                            OpenSessionAction.showResumeDialog(project, session)
+                        } else {
+                            OpenSessionAction.openSession(project, session)
+                        }
                     }
                 }
 
@@ -133,11 +147,16 @@ class ClaudeSessionPanel(private val project: Project, parentDisposable: Disposa
         menu.add(header)
         menu.addSeparator()
 
-        // Open / focus
-        val openItem = JMenuItem("Open Session", AllIcons.Actions.Execute)
-        openItem.isEnabled = session.state != SessionState.FINISHED
-        openItem.addActionListener { OpenSessionAction.openSession(project, session) }
-        menu.add(openItem)
+        // Open / focus (active sessions) or Resume (finished sessions)
+        if (session.state == SessionState.FINISHED) {
+            val resumeItem = JMenuItem("Resume Session", AllIcons.Actions.Restart)
+            resumeItem.addActionListener { OpenSessionAction.showResumeDialog(project, session) }
+            menu.add(resumeItem)
+        } else {
+            val openItem = JMenuItem("Open Session", AllIcons.Actions.Execute)
+            openItem.addActionListener { OpenSessionAction.openSession(project, session) }
+            menu.add(openItem)
+        }
 
         // Reveal in Finder
         val finderItem = JMenuItem("Reveal in Finder", AllIcons.Actions.ShowAsTree)
@@ -162,6 +181,13 @@ class ClaudeSessionPanel(private val project: Project, parentDisposable: Disposa
             CopyPasteManager.getInstance().setContents(StringSelection(session.pid.toString()))
         }
         menu.add(copyPidItem)
+
+        // Copy Session ID
+        val copySessionIdItem = JMenuItem("Copy Session ID")
+        copySessionIdItem.addActionListener {
+            CopyPasteManager.getInstance().setContents(StringSelection(session.sessionId))
+        }
+        menu.add(copySessionIdItem)
 
         // Kill session
         if (session.state != SessionState.FINISHED) {
@@ -222,9 +248,10 @@ class ClaudeSessionPanel(private val project: Project, parentDisposable: Disposa
         val waiting = sessions.count {
             it.state == SessionState.WAITING_FOR_INPUT || it.state == SessionState.WAITING_FOR_ACCEPT
         }
+        val finished = sessions.count { it.state == SessionState.FINISHED }
         statusLabel.text = when {
             sessions.isEmpty() -> "No active sessions"
-            else -> "${sessions.size} session(s)  \u2022  $running running  \u2022  $waiting waiting"
+            else -> "${sessions.size} session(s)  \u2022  $running running  \u2022  $waiting waiting  \u2022  $finished finished"
         }
     }
 
@@ -234,7 +261,7 @@ class ClaudeSessionPanel(private val project: Project, parentDisposable: Disposa
 
     private inner class SessionTableModel : AbstractTableModel() {
         private var data: List<ClaudeSession> = emptyList()
-        private val columns = arrayOf("Project", "Status", "Last message", "Duration", "Started")
+        private val columns = arrayOf("Project", "Env", "Status", "Last message", "Duration", "Started", "")
 
         fun updateData(sessions: List<ClaudeSession>) {
             data = sessions.sortedWith(compareBy({ stateOrder(it.state) }, { it.projectName }))
@@ -259,11 +286,13 @@ class ClaudeSessionPanel(private val project: Project, parentDisposable: Disposa
         override fun getValueAt(row: Int, col: Int): Any {
             val s = data[row]
             return when (col) {
-                0 -> s
-                1 -> s.state
-                2 -> s.lastAssistantMessage
-                3 -> s
-                4 -> s.startedAtInstant
+                0 -> s                          // project badge
+                1 -> s.environment              // environment
+                2 -> s.state                    // status
+                3 -> s.lastAssistantMessage     // last message
+                4 -> s                          // duration (needs full session)
+                5 -> s.startedAtInstant         // started time
+                6 -> s                          // action button (needs full session)
                 else -> ""
             }
         }
@@ -336,9 +365,41 @@ class ClaudeSessionPanel(private val project: Project, parentDisposable: Disposa
             label.iconTextGap = JBUI.scale(6)
             label.font = label.font.deriveFont(Font.BOLD)
             label.border = JBUI.Borders.empty(0, 6)
-            label.toolTipText = "<html><b>${session.projectName}</b><br>${session.cwd}<br>PID: ${session.pid}</html>"
+            label.toolTipText = "<html><b>${session.projectName}</b><br>${session.cwd}<br>PID: ${session.pid}<br>Session: ${session.sessionId}</html>"
 
             // Dim finished sessions
+            if (!isSelected && session.state == SessionState.FINISHED) {
+                label.foreground = UIUtil.getLabelDisabledForeground()
+            }
+
+            return label
+        }
+    }
+
+    private inner class EnvironmentRenderer : DefaultTableCellRenderer() {
+        override fun getTableCellRendererComponent(
+            table: JTable, value: Any?, isSelected: Boolean, hasFocus: Boolean, row: Int, col: Int
+        ): Component {
+            val env = value as? SessionEnvironment ?: SessionEnvironment.UNKNOWN
+            val label = super.getTableCellRendererComponent(
+                table, env.displayName, isSelected, hasFocus, row, col) as JLabel
+
+            label.icon = when (env) {
+                SessionEnvironment.JETBRAINS_TERMINAL -> AllIcons.Nodes.IdeaProject
+                SessionEnvironment.EXTERNAL_TERMINAL -> AllIcons.Debugger.Console
+                SessionEnvironment.UNKNOWN -> AllIcons.General.QuestionDialog
+            }
+            label.iconTextGap = JBUI.scale(4)
+            label.border = JBUI.Borders.empty(0, 4)
+            label.font = label.font.deriveFont(Font.PLAIN, JBUI.scale(11).toFloat())
+            label.toolTipText = when (env) {
+                SessionEnvironment.JETBRAINS_TERMINAL -> "Running in JetBrains IDE terminal"
+                SessionEnvironment.EXTERNAL_TERMINAL -> "Running in external terminal (iTerm2, Terminal.app, etc.)"
+                SessionEnvironment.UNKNOWN -> "Environment could not be determined"
+            }
+
+            // Dim for finished sessions
+            val session = tableModel.getSession(row)
             if (!isSelected && session.state == SessionState.FINISHED) {
                 label.foreground = UIUtil.getLabelDisabledForeground()
             }
@@ -432,6 +493,39 @@ class ClaudeSessionPanel(private val project: Project, parentDisposable: Disposa
                 table, time?.let { timeFormatter.format(it) } ?: "\u2014",
                 isSelected, hasFocus, row, col) as JLabel
             label.border = JBUI.Borders.empty(0, 4)
+            return label
+        }
+    }
+
+    private inner class ActionButtonRenderer : DefaultTableCellRenderer() {
+        override fun getTableCellRendererComponent(
+            table: JTable, value: Any?, isSelected: Boolean, hasFocus: Boolean, row: Int, col: Int
+        ): Component {
+            val session = value as? ClaudeSession
+            val isFinished = session?.state == SessionState.FINISHED
+
+            val label = super.getTableCellRendererComponent(
+                table,
+                if (isFinished) "Resume" else "Open",
+                isSelected, hasFocus, row, col
+            ) as JLabel
+
+            label.icon = if (isFinished) AllIcons.Actions.Restart else AllIcons.Actions.Execute
+            label.iconTextGap = JBUI.scale(3)
+            label.horizontalAlignment = SwingConstants.CENTER
+            label.border = JBUI.Borders.empty(0, 4)
+            label.cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+            label.font = label.font.deriveFont(Font.BOLD, JBUI.scale(11).toFloat())
+
+            if (!isSelected) {
+                label.foreground = JBColor(Color(0x4285F4), Color(0x5C9DF5))
+            }
+
+            label.toolTipText = if (isFinished)
+                "Resume this finished session"
+            else
+                "Open / focus this session"
+
             return label
         }
     }

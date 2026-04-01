@@ -2,38 +2,51 @@ package com.coding9.claudecode.actions
 
 import com.coding9.claudecode.model.ClaudeSession
 import com.coding9.claudecode.model.SessionState
+import com.intellij.icons.AllIcons
 import com.intellij.notification.NotificationGroupManager
 import com.intellij.notification.NotificationType
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.diagnostic.thisLogger
+import com.intellij.openapi.ide.CopyPasteManager
+import com.intellij.openapi.project.Project
 import com.intellij.openapi.project.ProjectManager
 import com.intellij.openapi.wm.ToolWindowManager
+import com.intellij.openapi.wm.WindowManager
+import com.intellij.ui.JBColor
+import com.intellij.util.ui.JBUI
+import java.awt.*
+import java.awt.datatransfer.StringSelection
 import java.io.File
+import javax.swing.*
 
 /**
  * Logic for "opening" a Claude session:
  *
- * Priority order:
+ * Active sessions:
  *  1. Focus the actual terminal window where Claude is running
  *     (iTerm2 or Terminal.app, detected via the process's TTY)
- *  2. Claude is running inside PhpStorm's own terminal
+ *  2. Claude is running inside the IDE's own terminal
  *     → bring the IDE window + terminal tab to the front
  *  3. Nothing worked → offer to open the project in the IDE
+ *
+ * Finished sessions:
+ *  → Show a dialog to choose between Terminal or JetBrains IDE,
+ *    then resume with `claude --resume <sessionId>`
  */
 object OpenSessionAction {
 
     private val log = thisLogger()
 
-    fun openSession(callerProject: com.intellij.openapi.project.Project, session: ClaudeSession) {
+    fun openSession(callerProject: Project, session: ClaudeSession) {
         if (session.state == SessionState.FINISHED) {
-            notify(callerProject, "Session '${session.projectName}' has already finished.", NotificationType.INFORMATION)
+            showResumeDialog(callerProject, session)
             return
         }
 
         // --- Step 1: focus the real terminal window (iTerm2 / Terminal.app) ---
         if (focusExternalTerminal(session)) return
 
-        // --- Step 2: maybe it's running inside PhpStorm's built-in terminal ---
+        // --- Step 2: maybe it's running inside the IDE's built-in terminal ---
         val openProject = ProjectManager.getInstance().openProjects.firstOrNull { project ->
             val base = project.basePath ?: return@firstOrNull false
             File(base).canonicalPath == File(session.cwd).canonicalPath
@@ -52,27 +65,374 @@ object OpenSessionAction {
         )
     }
 
-    // -------------------------------------------------------------------------
-    // Step 1 – focus an open JetBrains project + Terminal tab
-    // -------------------------------------------------------------------------
+    // =========================================================================
+    // Resume dialog for finished sessions
+    // =========================================================================
 
-    private fun focusProjectTerminal(project: com.intellij.openapi.project.Project, session: ClaudeSession) {
+    fun showResumeDialog(callerProject: Project, session: ClaudeSession) {
+        ApplicationManager.getApplication().invokeLater {
+            val dialog = ResumeChoiceDialog(session)
+            dialog.isVisible = true
+
+            when (dialog.choice) {
+                ResumeChoice.TERMINAL -> resumeInExternalTerminal(session)
+                ResumeChoice.JETBRAINS -> resumeInJetBrains(callerProject, session)
+                ResumeChoice.CANCELLED -> { /* do nothing */ }
+            }
+        }
+    }
+
+    private enum class ResumeChoice { TERMINAL, JETBRAINS, CANCELLED }
+
+    private class ResumeChoiceDialog(session: ClaudeSession) : JDialog(
+        null as Frame?, "Resume Session", true
+    ) {
+        var choice: ResumeChoice = ResumeChoice.CANCELLED
+            private set
+
+        init {
+            defaultCloseOperation = DISPOSE_ON_CLOSE
+            isResizable = false
+
+            val content = JPanel(BorderLayout(0, JBUI.scale(12)))
+            content.border = JBUI.Borders.empty(16, 20)
+
+            // Header
+            val headerLabel = JLabel(
+                "<html><b>Resume session in '${session.projectName}'</b><br>" +
+                "<span style='color:gray;font-size:11px'>${session.cwd}</span></html>"
+            )
+            headerLabel.icon = AllIcons.Actions.Restart
+            headerLabel.iconTextGap = JBUI.scale(8)
+            content.add(headerLabel, BorderLayout.NORTH)
+
+            // Buttons panel
+            val buttonsPanel = JPanel(GridLayout(1, 2, JBUI.scale(10), 0))
+
+            val terminalBtn = createChoiceButton(
+                "Terminal",
+                "Open in external terminal",
+                AllIcons.Debugger.Console
+            ) {
+                choice = ResumeChoice.TERMINAL
+                dispose()
+            }
+
+            val jetbrainsBtn = createChoiceButton(
+                "JetBrains IDE",
+                "Open project & terminal in IDE",
+                AllIcons.Nodes.IdeaProject
+            ) {
+                choice = ResumeChoice.JETBRAINS
+                dispose()
+            }
+
+            buttonsPanel.add(terminalBtn)
+            buttonsPanel.add(jetbrainsBtn)
+            content.add(buttonsPanel, BorderLayout.CENTER)
+
+            // Cancel
+            val cancelBtn = JButton("Cancel")
+            cancelBtn.addActionListener { dispose() }
+            val cancelPanel = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0))
+            cancelPanel.add(cancelBtn)
+            content.add(cancelPanel, BorderLayout.SOUTH)
+
+            contentPane = content
+            pack()
+            setLocationRelativeTo(null)
+        }
+
+        private fun createChoiceButton(
+            title: String, subtitle: String, icon: Icon, action: () -> Unit
+        ): JButton {
+            val btn = JButton("<html><center><b>$title</b><br><span style='font-size:10px;color:gray'>$subtitle</span></center></html>")
+            btn.icon = icon
+            btn.horizontalTextPosition = SwingConstants.CENTER
+            btn.verticalTextPosition = SwingConstants.BOTTOM
+            btn.iconTextGap = JBUI.scale(6)
+            btn.preferredSize = Dimension(JBUI.scale(180), JBUI.scale(80))
+            btn.cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+            btn.addActionListener { action() }
+            return btn
+        }
+    }
+
+    // =========================================================================
+    // Resume in external terminal
+    // =========================================================================
+
+    private fun resumeInExternalTerminal(session: ClaudeSession) {
+        val resumeCmd = "cd '${session.cwd}' && claude --resume '${session.sessionId}'"
+        val os = System.getProperty("os.name", "").lowercase()
+
+        if (os.contains("mac")) {
+            val script = """
+                tell application "Terminal"
+                    do script "$resumeCmd"
+                    activate
+                end tell
+            """.trimIndent()
+            ProcessBuilder("osascript", "-e", script).start()
+        } else {
+            // Linux: try common terminal emulators
+            val terminals = listOf(
+                listOf("gnome-terminal", "--", "bash", "-c", "$resumeCmd; exec bash"),
+                listOf("konsole", "-e", "bash", "-c", "$resumeCmd; exec bash"),
+                listOf("xterm", "-e", "bash", "-c", "$resumeCmd; exec bash"),
+                listOf("x-terminal-emulator", "-e", "bash", "-c", "$resumeCmd; exec bash")
+            )
+            for (cmd in terminals) {
+                try {
+                    ProcessBuilder(cmd).start()
+                    return
+                } catch (_: Exception) { /* try next */ }
+            }
+            log.warn("Could not find a terminal emulator to resume session")
+        }
+    }
+
+    // =========================================================================
+    // Resume in JetBrains IDE
+    // =========================================================================
+
+    private fun resumeInJetBrains(callerProject: Project, session: ClaudeSession) {
+        // Check if the project is already open in any IDE window
+        val openProject = ProjectManager.getInstance().openProjects.firstOrNull { project ->
+            val base = project.basePath ?: return@firstOrNull false
+            try { File(base).canonicalPath == File(session.cwd).canonicalPath } catch (_: Exception) { false }
+        }
+
+        if (openProject != null) {
+            createResumeTerminalTab(openProject, session)
+            return
+        }
+
+        // Project not open → detect installed JetBrains IDEs and let user pick
+        val installedIdes = detectInstalledIdes()
+        if (installedIdes.isEmpty()) {
+            // Fallback: open in current IDE
+            openProjectInCurrentIde(callerProject, session)
+            return
+        }
+
+        ApplicationManager.getApplication().invokeLater {
+            val ideNames = installedIdes.map { it.name }.toTypedArray()
+            val selected = JOptionPane.showInputDialog(
+                null,
+                "Select JetBrains IDE to open '${session.projectName}':",
+                "Choose IDE",
+                JOptionPane.QUESTION_MESSAGE,
+                AllIcons.Nodes.IdeaProject,
+                ideNames,
+                ideNames.firstOrNull()
+            ) as? String ?: return@invokeLater
+
+            val ide = installedIdes.first { it.name == selected }
+            launchIdeWithResume(ide, session)
+        }
+    }
+
+    data class JetBrainsIde(val name: String, val command: String, val appPath: String?)
+
+    private fun detectInstalledIdes(): List<JetBrainsIde> {
+        val ides = mutableListOf<JetBrainsIde>()
+        val knownApps = linkedMapOf(
+            "PhpStorm" to "phpstorm",
+            "IntelliJ IDEA" to "idea",
+            "IntelliJ IDEA CE" to "idea",
+            "WebStorm" to "webstorm",
+            "PyCharm" to "pycharm",
+            "GoLand" to "goland",
+            "CLion" to "clion",
+            "RubyMine" to "rubymine",
+            "Rider" to "rider",
+            "DataGrip" to "datagrip",
+            "Android Studio" to "studio"
+        )
+
+        val os = System.getProperty("os.name", "").lowercase()
+        if (os.contains("mac")) {
+            // macOS: check /Applications for .app bundles
+            val appsDir = File("/Applications")
+            if (appsDir.isDirectory) {
+                appsDir.listFiles()?.forEach { app ->
+                    if (!app.name.endsWith(".app")) return@forEach
+                    for ((name, cmd) in knownApps) {
+                        if (app.name.contains(name, ignoreCase = true)) {
+                            ides.add(JetBrainsIde(app.nameWithoutExtension, cmd, app.absolutePath))
+                        }
+                    }
+                }
+            }
+        }
+
+        // Also check PATH for CLI launchers (Linux + macOS Toolbox)
+        for ((name, cmd) in knownApps) {
+            if (ides.any { it.command == cmd }) continue
+            try {
+                val result = ProcessBuilder("which", cmd).start()
+                val path = result.inputStream.bufferedReader().readText().trim()
+                if (result.waitFor() == 0 && path.isNotEmpty()) {
+                    ides.add(JetBrainsIde(name, cmd, null))
+                }
+            } catch (_: Exception) { /* not found */ }
+        }
+
+        return ides
+    }
+
+    private fun launchIdeWithResume(ide: JetBrainsIde, session: ClaudeSession) {
+        val resumeCmd = "claude --resume '${session.sessionId}'"
+
+        try {
+            if (ide.appPath != null) {
+                // macOS: open -a "AppPath" <projectDir>
+                ProcessBuilder("open", "-a", ide.appPath, session.cwd).start()
+            } else {
+                // CLI launcher: <command> <projectDir>
+                ProcessBuilder(ide.command, session.cwd).start()
+            }
+
+            // Copy the resume command to clipboard so the user can paste it in the terminal
+            CopyPasteManager.getInstance().setContents(StringSelection(resumeCmd))
+            NotificationGroupManager.getInstance()
+                .getNotificationGroup("Claude Code Sessions")
+                ?.createNotification(
+                    "Claude Code Sessions",
+                    "Opening '${session.projectName}' in ${ide.name}.\n" +
+                    "Resume command copied to clipboard:\n$resumeCmd\n\n" +
+                    "Open a terminal in the IDE and paste to resume.",
+                    NotificationType.INFORMATION
+                )?.notify(null)
+        } catch (e: Exception) {
+            log.warn("Failed to launch IDE: ${ide.name}", e)
+        }
+    }
+
+    private fun openProjectInCurrentIde(callerProject: Project, session: ClaudeSession) {
         ApplicationManager.getApplication().invokeLater {
             try {
-                // Bring the IDE frame to the front
-                val frame = com.intellij.openapi.wm.WindowManager.getInstance().getFrame(project)
+                ProjectManager.getInstance().loadAndOpenProject(session.cwd)?.let { newProject ->
+                    // Wait a bit for the project to initialize, then create a terminal tab
+                    Timer(2000) { createResumeTerminalTab(newProject, session) }.apply {
+                        isRepeats = false
+                        start()
+                    }
+                }
+            } catch (e: Exception) {
+                log.warn("Could not open project: ${session.cwd}", e)
+                notify(callerProject, "Could not open project: ${session.cwd}", NotificationType.ERROR)
+            }
+        }
+    }
+
+    private fun createResumeTerminalTab(project: Project, session: ClaudeSession) {
+        ApplicationManager.getApplication().invokeLater {
+            try {
+                // Focus the IDE window
+                val frame = WindowManager.getInstance().getFrame(project)
                 frame?.toFront()
                 frame?.requestFocus()
 
-                // Open / reveal the Terminal tool window
+                // Open Terminal tool window
+                val toolWindowManager = ToolWindowManager.getInstance(project)
+                val terminalWindow = toolWindowManager.getToolWindow("Terminal")
+
+                if (terminalWindow != null) {
+                    terminalWindow.show()
+                    // Create a new terminal tab with the resume command
+                    createTerminalWithCommand(project, session.cwd, "claude --resume '${session.sessionId}'")
+                } else {
+                    notify(project, "Terminal not available. Run manually:\nclaude --resume '${session.sessionId}'", NotificationType.INFORMATION)
+                }
+            } catch (e: Exception) {
+                log.warn("Could not create resume terminal tab", e)
+            }
+        }
+    }
+
+    private fun createTerminalWithCommand(project: Project, basePath: String, command: String) {
+        try {
+            val terminalViewClass = Class.forName("org.jetbrains.plugins.terminal.TerminalView")
+            val getInstance = terminalViewClass.getMethod("getInstance", Project::class.java)
+            val terminalView = getInstance.invoke(null, project)
+
+            // Try to create a new shell widget
+            val createMethod = terminalViewClass.methods.firstOrNull { m ->
+                m.name == "createLocalShellWidget" && m.parameterCount >= 2
+            }
+
+            if (createMethod != null) {
+                val widget = createMethod.invoke(terminalView, basePath, "Claude Resume")
+                // Try to send the command to the widget
+                sendCommandToWidget(widget, command)
+            } else {
+                // Fallback: copy command to clipboard and notify
+                CopyPasteManager.getInstance().setContents(StringSelection(command))
+                notify(project, "Resume command copied to clipboard:\n$command", NotificationType.INFORMATION)
+            }
+        } catch (_: ClassNotFoundException) {
+            // Terminal plugin not available
+            CopyPasteManager.getInstance().setContents(StringSelection(command))
+            notify(project, "Terminal plugin not found. Resume command copied to clipboard:\n$command", NotificationType.INFORMATION)
+        } catch (e: Exception) {
+            log.warn("Could not create terminal with command", e)
+            CopyPasteManager.getInstance().setContents(StringSelection(command))
+            notify(project, "Resume command copied to clipboard:\n$command", NotificationType.INFORMATION)
+        }
+    }
+
+    private fun sendCommandToWidget(widget: Any?, command: String) {
+        if (widget == null) return
+        try {
+            // Try ShellTerminalWidget.executeCommand (newer API)
+            val executeMethod = widget.javaClass.methods.firstOrNull { m ->
+                m.name == "executeCommand" && m.parameterCount == 1
+            }
+            if (executeMethod != null) {
+                executeMethod.invoke(widget, command)
+                return
+            }
+
+            // Fallback: try sendCommandToExecute
+            val sendMethod = widget.javaClass.methods.firstOrNull { m ->
+                m.name == "sendCommandToExecute" && m.parameterCount == 1
+            }
+            if (sendMethod != null) {
+                sendMethod.invoke(widget, command)
+                return
+            }
+
+            // Last resort: type the command via the terminal's input
+            val typedMethod = widget.javaClass.methods.firstOrNull { m ->
+                m.name == "writePlainMessage" || m.name == "writeCharacter"
+            }
+            if (typedMethod != null) {
+                typedMethod.invoke(widget, command + "\n")
+            }
+        } catch (e: Exception) {
+            log.debug("Could not send command to terminal widget: ${e.message}")
+        }
+    }
+
+    // =========================================================================
+    // Focus active session in JetBrains project terminal
+    // =========================================================================
+
+    private fun focusProjectTerminal(project: Project, session: ClaudeSession) {
+        ApplicationManager.getApplication().invokeLater {
+            try {
+                val frame = WindowManager.getInstance().getFrame(project)
+                frame?.toFront()
+                frame?.requestFocus()
+
                 val toolWindowManager = ToolWindowManager.getInstance(project)
                 val terminalWindow = toolWindowManager.getToolWindow("Terminal")
                 if (terminalWindow != null) {
                     terminalWindow.show()
-                    // Try to find the tab whose PID matches
                     focusTerminalTabByPid(terminalWindow, session.pid)
                 } else {
-                    // Fallback: just show the project
                     notify(project, "Switched to project '${session.projectName}'.\nOpen the Terminal to interact with Claude.", NotificationType.INFORMATION)
                 }
             } catch (e: Exception) {
@@ -81,10 +441,6 @@ object OpenSessionAction {
         }
     }
 
-    /**
-     * Attempt to find the Terminal tab whose shell process matches `pid`
-     * (or is a direct parent of `pid`).  Works with the JetBrains Terminal plugin.
-     */
     private fun focusTerminalTabByPid(
         toolWindow: com.intellij.openapi.wm.ToolWindow,
         targetPid: Long
@@ -92,14 +448,9 @@ object OpenSessionAction {
         val contentManager = toolWindow.contentManager
         val tabCount = contentManager.contentCount
 
-        // Walk each tab and check the process tree
         for (i in 0 until tabCount) {
             val content = contentManager.getContent(i) ?: continue
             val component = content.component
-
-            // The JetBrains Terminal widget hierarchy ends with a TerminalWidget
-            // whose processHandler holds the shell PID. We use reflection to stay
-            // compatible across IDE versions without hard-coding internal class names.
             val shellPid = extractShellPid(component) ?: continue
 
             if (isClaudeSession(shellPid, targetPid)) {
@@ -107,13 +458,10 @@ object OpenSessionAction {
                 return
             }
         }
-        // No matching tab found – the session might be in an external terminal
     }
 
-    /** Try to extract a PID from a Terminal component using reflection. */
     private fun extractShellPid(component: java.awt.Component): Long? {
         return try {
-            // Walk fields looking for a ProcessHandler or similar
             var current: Any? = component
             for (depth in 0..5) {
                 if (current == null) break
@@ -124,7 +472,6 @@ object OpenSessionAction {
                     pidField.isAccessible = true
                     return pidField.getLong(current)
                 }
-                // Recurse into the first interesting field
                 current = current.javaClass.declaredFields.firstOrNull()?.let { f ->
                     f.isAccessible = true
                     f.get(current)
@@ -134,10 +481,6 @@ object OpenSessionAction {
         } catch (_: Exception) { null }
     }
 
-    /**
-     * Return true if `claudePid` is a descendant of `shellPid` (or equal).
-     * Claude runs as a child of the shell that launched it.
-     */
     private fun isClaudeSession(shellPid: Long, claudePid: Long): Boolean {
         if (shellPid == claudePid) return true
         return try {
@@ -149,19 +492,15 @@ object OpenSessionAction {
         } catch (_: Exception) { false }
     }
 
-    // -------------------------------------------------------------------------
-    // Step 2 – bring external terminal window to front via AppleScript
-    // -------------------------------------------------------------------------
+    // =========================================================================
+    // Focus external terminal window via AppleScript
+    // =========================================================================
 
     private fun focusExternalTerminal(session: ClaudeSession): Boolean {
-        // Determine which terminal app has the process
         val tty = getProcessTty(session.pid) ?: return false
-
-        // Try iTerm2 first, then Terminal.app
         return focusITerm2(session.pid, tty) || focusTerminalApp(session.pid, tty)
     }
 
-    /** Get the TTY device of a process (e.g. "s006") */
     private fun getProcessTty(pid: Long): String? {
         return try {
             val output = ProcessBuilder("ps", "-p", pid.toString(), "-o", "tty=")
@@ -229,11 +568,11 @@ object OpenSessionAction {
         }
     }
 
-    // -------------------------------------------------------------------------
+    // =========================================================================
     // Helpers
-    // -------------------------------------------------------------------------
+    // =========================================================================
 
-    private fun notify(project: com.intellij.openapi.project.Project, message: String, type: NotificationType) {
+    private fun notify(project: Project, message: String, type: NotificationType) {
         NotificationGroupManager.getInstance()
             .getNotificationGroup("Claude Code Sessions")
             ?.createNotification("Claude Code Sessions", message, type)

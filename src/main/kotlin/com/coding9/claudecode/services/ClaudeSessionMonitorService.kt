@@ -1,6 +1,7 @@
 package com.coding9.claudecode.services
 
 import com.coding9.claudecode.model.ClaudeSession
+import com.coding9.claudecode.model.SessionEnvironment
 import com.coding9.claudecode.model.SessionState
 import com.google.gson.Gson
 import com.google.gson.JsonObject
@@ -153,6 +154,8 @@ class ClaudeSessionMonitorService : Disposable {
         }
 
         jsonlFile?.let { session.lastAssistantMessage = readLastAssistantSnippet(it) }
+
+        session.environment = detectEnvironment(session.pid)
     }
 
     // ------------------------------------------------------------------
@@ -220,6 +223,40 @@ class ClaudeSessionMonitorService : Disposable {
                 else -> ""
             }
         } catch (e: Exception) { "" }
+    }
+
+    // ------------------------------------------------------------------
+    // Environment detection – walk the process tree to find JetBrains
+    // ------------------------------------------------------------------
+
+    private val JETBRAINS_NAMES = listOf(
+        "idea", "phpstorm", "webstorm", "pycharm", "rubymine",
+        "goland", "clion", "rider", "datagrip", "appcode", "fleet",
+        "intellij", "android-studio", "studio"
+    )
+
+    private fun detectEnvironment(pid: Long): SessionEnvironment {
+        return try {
+            var handle: ProcessHandle = ProcessHandle.of(pid).orElse(null) ?: return SessionEnvironment.UNKNOWN
+            if (!handle.isAlive) return SessionEnvironment.UNKNOWN
+
+            var depth = 0
+            while (depth < 15) {
+                val parent = handle.parent().orElse(null) ?: break
+                val command = parent.info().command().orElse("")
+                if (isJetBrainsProcess(command)) return SessionEnvironment.JETBRAINS_TERMINAL
+                handle = parent
+                depth++
+            }
+            SessionEnvironment.EXTERNAL_TERMINAL
+        } catch (_: Exception) {
+            SessionEnvironment.UNKNOWN
+        }
+    }
+
+    private fun isJetBrainsProcess(command: String): Boolean {
+        val lower = command.lowercase()
+        return JETBRAINS_NAMES.any { lower.contains(it) }
     }
 
     // ------------------------------------------------------------------
