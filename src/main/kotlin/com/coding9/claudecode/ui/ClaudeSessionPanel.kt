@@ -16,6 +16,7 @@ import com.intellij.openapi.ide.CopyPasteManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
 import com.intellij.ui.JBColor
+import com.intellij.ui.SearchTextField
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.ui.table.JBTable
@@ -23,6 +24,8 @@ import com.intellij.util.ui.JBUI
 import com.intellij.util.ui.UIUtil
 import java.awt.*
 import java.awt.datatransfer.StringSelection
+import java.awt.event.KeyAdapter
+import java.awt.event.KeyEvent
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import java.awt.geom.RoundRectangle2D
@@ -34,6 +37,7 @@ import java.time.format.DateTimeFormatter
 import javax.swing.*
 import javax.swing.table.AbstractTableModel
 import javax.swing.table.DefaultTableCellRenderer
+import javax.swing.table.TableRowSorter
 
 class ClaudeSessionPanel(private val project: Project, parentDisposable: Disposable) :
     JPanel(BorderLayout()), Disposable {
@@ -41,6 +45,8 @@ class ClaudeSessionPanel(private val project: Project, parentDisposable: Disposa
     private val tableModel = SessionTableModel()
     private val table = JBTable(tableModel)
     private val statusLabel = JBLabel("")
+    private val searchField = SearchTextField(false)
+    private val rowSorter = TableRowSorter<AbstractTableModel>(tableModel)
 
     // Keep an explicit reference so we can remove the exact same listener instance
     private val sessionsListener = SessionsListener { sessions -> updateSessions(sessions) }
@@ -48,7 +54,15 @@ class ClaudeSessionPanel(private val project: Project, parentDisposable: Disposa
     init {
         border = JBUI.Borders.empty()
         setupTable()
-        add(buildToolbar(), BorderLayout.NORTH)
+        setupSearch()
+        setupKeyboardShortcuts()
+
+        val topPanel = JPanel(BorderLayout()).apply {
+            add(buildToolbar(), BorderLayout.CENTER)
+            add(searchField, BorderLayout.EAST)
+        }
+
+        add(topPanel, BorderLayout.NORTH)
         add(JBScrollPane(table), BorderLayout.CENTER)
         add(buildStatusBar(), BorderLayout.SOUTH)
 
@@ -72,39 +86,47 @@ class ClaudeSessionPanel(private val project: Project, parentDisposable: Disposa
     private fun setupTable() {
         table.apply {
             setShowGrid(false)
-            intercellSpacing = java.awt.Dimension(0, 0)
+            intercellSpacing = Dimension(0, 0)
             rowHeight = JBUI.scale(34)
             selectionModel.selectionMode = ListSelectionModel.SINGLE_SELECTION
             emptyText.text = "No active Claude Code sessions"
+            autoCreateRowSorter = false
+            setRowSorter(rowSorter)
 
-            // Column widths: Project | Env | Status | Last message | Duration | Started | Action
-            columnModel.getColumn(0).apply { minWidth = JBUI.scale(160); preferredWidth = JBUI.scale(180) }
-            columnModel.getColumn(1).apply { minWidth = JBUI.scale(80); preferredWidth = JBUI.scale(90); maxWidth = JBUI.scale(100) }
-            columnModel.getColumn(2).preferredWidth = JBUI.scale(120)
-            columnModel.getColumn(3).preferredWidth = JBUI.scale(190)
-            columnModel.getColumn(4).preferredWidth = JBUI.scale(70)
-            columnModel.getColumn(5).preferredWidth = JBUI.scale(55)
-            columnModel.getColumn(6).apply { minWidth = JBUI.scale(70); preferredWidth = JBUI.scale(80); maxWidth = JBUI.scale(90) }
+            // Column widths: Project | Env | Status | CPU | Last message | Duration | Started | Action
+            columnModel.getColumn(COL_PROJECT).apply { minWidth = JBUI.scale(140); preferredWidth = JBUI.scale(160) }
+            columnModel.getColumn(COL_ENV).apply { minWidth = JBUI.scale(75); preferredWidth = JBUI.scale(85); maxWidth = JBUI.scale(95) }
+            columnModel.getColumn(COL_STATUS).preferredWidth = JBUI.scale(115)
+            columnModel.getColumn(COL_CPU).apply { minWidth = JBUI.scale(45); preferredWidth = JBUI.scale(55); maxWidth = JBUI.scale(65) }
+            columnModel.getColumn(COL_MESSAGE).preferredWidth = JBUI.scale(170)
+            columnModel.getColumn(COL_DURATION).preferredWidth = JBUI.scale(65)
+            columnModel.getColumn(COL_STARTED).preferredWidth = JBUI.scale(50)
+            columnModel.getColumn(COL_ACTION).apply { minWidth = JBUI.scale(65); preferredWidth = JBUI.scale(75); maxWidth = JBUI.scale(85) }
 
             // Custom renderers
-            columnModel.getColumn(0).cellRenderer = ProjectBadgeRenderer()
-            columnModel.getColumn(1).cellRenderer = EnvironmentRenderer()
-            columnModel.getColumn(2).cellRenderer = StateTextRenderer()
-            columnModel.getColumn(3).cellRenderer = LastMessageRenderer()
-            columnModel.getColumn(4).cellRenderer = DurationRenderer()
-            columnModel.getColumn(5).cellRenderer = TimeRenderer()
-            columnModel.getColumn(6).cellRenderer = ActionButtonRenderer()
+            columnModel.getColumn(COL_PROJECT).cellRenderer = ProjectBadgeRenderer()
+            columnModel.getColumn(COL_ENV).cellRenderer = EnvironmentRenderer()
+            columnModel.getColumn(COL_STATUS).cellRenderer = StateTextRenderer()
+            columnModel.getColumn(COL_CPU).cellRenderer = CpuRenderer()
+            columnModel.getColumn(COL_MESSAGE).cellRenderer = LastMessageRenderer()
+            columnModel.getColumn(COL_DURATION).cellRenderer = DurationRenderer()
+            columnModel.getColumn(COL_STARTED).cellRenderer = TimeRenderer()
+            columnModel.getColumn(COL_ACTION).cellRenderer = ActionButtonRenderer()
+
+            // Default sort: state priority ascending
+            rowSorter.sortKeys = listOf(RowSorter.SortKey(COL_STATUS, SortOrder.ASCENDING))
 
             // Mouse listener for clicks and hover
             addMouseListener(object : MouseAdapter() {
                 override fun mouseClicked(e: MouseEvent) {
-                    val row = rowAtPoint(e.point)
+                    val viewRow = rowAtPoint(e.point)
                     val col = columnAtPoint(e.point)
-                    if (row < 0) return
+                    if (viewRow < 0) return
+                    val modelRow = convertRowIndexToModel(viewRow)
 
                     // Click on action button column OR double-click anywhere
-                    if (col == 6 || (e.clickCount == 2 && e.button == MouseEvent.BUTTON1)) {
-                        val session = tableModel.getSession(row)
+                    if (col == COL_ACTION || (e.clickCount == 2 && e.button == MouseEvent.BUTTON1)) {
+                        val session = tableModel.getSession(modelRow)
                         if (session.state == SessionState.FINISHED) {
                             OpenSessionAction.showResumeDialog(project, session)
                         } else {
@@ -119,10 +141,11 @@ class ClaudeSessionPanel(private val project: Project, parentDisposable: Disposa
 
                 private fun maybeShowPopup(e: MouseEvent) {
                     if (!e.isPopupTrigger) return
-                    val row = rowAtPoint(e.point)
-                    if (row < 0) return
-                    table.selectionModel.setSelectionInterval(row, row)
-                    buildContextMenu(tableModel.getSession(row)).show(table, e.x, e.y)
+                    val viewRow = rowAtPoint(e.point)
+                    if (viewRow < 0) return
+                    table.selectionModel.setSelectionInterval(viewRow, viewRow)
+                    val modelRow = convertRowIndexToModel(viewRow)
+                    buildContextMenu(tableModel.getSession(modelRow)).show(table, e.x, e.y)
                 }
 
                 override fun mouseMoved(e: MouseEvent) {
@@ -130,6 +153,104 @@ class ClaudeSessionPanel(private val project: Project, parentDisposable: Disposa
                              else Cursor.getDefaultCursor()
                 }
             })
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Keyboard shortcuts
+    // -------------------------------------------------------------------------
+
+    private fun setupKeyboardShortcuts() {
+        // Enter: open/resume selected session
+        table.addKeyListener(object : KeyAdapter() {
+            override fun keyPressed(e: KeyEvent) {
+                when (e.keyCode) {
+                    KeyEvent.VK_ENTER -> {
+                        val viewRow = table.selectedRow
+                        if (viewRow >= 0) {
+                            val modelRow = table.convertRowIndexToModel(viewRow)
+                            val session = tableModel.getSession(modelRow)
+                            if (session.state == SessionState.FINISHED) {
+                                OpenSessionAction.showResumeDialog(project, session)
+                            } else {
+                                OpenSessionAction.openSession(project, session)
+                            }
+                            e.consume()
+                        }
+                    }
+                    KeyEvent.VK_F5 -> {
+                        ClaudeSessionMonitorService.getInstance().start()
+                        e.consume()
+                    }
+                    KeyEvent.VK_DELETE -> {
+                        val viewRow = table.selectedRow
+                        if (viewRow >= 0) {
+                            val modelRow = table.convertRowIndexToModel(viewRow)
+                            val session = tableModel.getSession(modelRow)
+                            if (session.state != SessionState.FINISHED) {
+                                confirmKillSession(session)
+                            }
+                            e.consume()
+                        }
+                    }
+                }
+            }
+        })
+
+        // Ctrl+F / Cmd+F: focus search field
+        val focusSearchAction = "focusSearch"
+        table.inputMap.put(
+            KeyStroke.getKeyStroke(KeyEvent.VK_F, Toolkit.getDefaultToolkit().menuShortcutKeyMaskEx),
+            focusSearchAction
+        )
+        table.actionMap.put(focusSearchAction, object : AbstractAction() {
+            override fun actionPerformed(e: java.awt.event.ActionEvent?) {
+                searchField.requestFocusInWindow()
+            }
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // Search / filter
+    // -------------------------------------------------------------------------
+
+    private fun setupSearch() {
+        searchField.textEditor.emptyText.text = "Filter sessions..."
+        searchField.preferredSize = Dimension(JBUI.scale(200), searchField.preferredSize.height)
+
+        searchField.addDocumentListener(object : com.intellij.ui.DocumentAdapter() {
+            override fun textChanged(e: javax.swing.event.DocumentEvent) {
+                applyFilter(searchField.text.trim())
+            }
+        })
+
+        // Escape in search field: clear and return focus to table
+        searchField.textEditor.addKeyListener(object : KeyAdapter() {
+            override fun keyPressed(e: KeyEvent) {
+                if (e.keyCode == KeyEvent.VK_ESCAPE) {
+                    searchField.text = ""
+                    table.requestFocusInWindow()
+                    e.consume()
+                }
+            }
+        })
+    }
+
+    private fun applyFilter(query: String) {
+        if (query.isEmpty()) {
+            rowSorter.rowFilter = null
+        } else {
+            val lowerQuery = query.lowercase()
+            rowSorter.rowFilter = object : RowFilter<AbstractTableModel, Int>() {
+                override fun include(entry: Entry<out AbstractTableModel, out Int>): Boolean {
+                    val session = tableModel.getSession(entry.identifier)
+                    return session.projectName.lowercase().contains(lowerQuery) ||
+                           session.cwd.lowercase().contains(lowerQuery) ||
+                           session.lastAssistantMessage.lowercase().contains(lowerQuery) ||
+                           session.state.displayName.lowercase().contains(lowerQuery) ||
+                           session.environment.displayName.lowercase().contains(lowerQuery)
+                }
+            }
         }
     }
 
@@ -158,11 +279,12 @@ class ClaudeSessionPanel(private val project: Project, parentDisposable: Disposa
             menu.add(openItem)
         }
 
-        // Reveal in Finder
-        val finderItem = JMenuItem("Reveal in Finder", AllIcons.Actions.ShowAsTree)
+        // Reveal in Finder / File Manager
+        val revealText = if (System.getProperty("os.name", "").lowercase().contains("mac")) "Reveal in Finder" else "Open in File Manager"
+        val finderItem = JMenuItem(revealText, AllIcons.Actions.ShowAsTree)
         finderItem.addActionListener {
             try { Desktop.getDesktop().open(File(session.cwd)) }
-            catch (e: Exception) { /* ignore */ }
+            catch (_: Exception) { /* ignore */ }
         }
         menu.add(finderItem)
 
@@ -193,22 +315,33 @@ class ClaudeSessionPanel(private val project: Project, parentDisposable: Disposa
         if (session.state != SessionState.FINISHED) {
             menu.addSeparator()
             val killItem = JMenuItem("Kill Session", AllIcons.Process.Stop)
-            killItem.addActionListener {
-                val confirm = JOptionPane.showConfirmDialog(
-                    table,
-                    "Kill Claude session in '${session.projectName}'?\nPID: ${session.pid}",
-                    "Kill Session",
-                    JOptionPane.YES_NO_OPTION,
-                    JOptionPane.WARNING_MESSAGE
-                )
-                if (confirm == JOptionPane.YES_OPTION) {
-                    ProcessHandle.of(session.pid).ifPresent { it.destroy() }
-                }
-            }
+            killItem.addActionListener { confirmKillSession(session) }
             menu.add(killItem)
         }
 
         return menu
+    }
+
+    private fun confirmKillSession(session: ClaudeSession) {
+        val confirm = JOptionPane.showConfirmDialog(
+            table,
+            "Kill Claude session in '${session.projectName}'?\nPID: ${session.pid}",
+            "Kill Session",
+            JOptionPane.YES_NO_OPTION,
+            JOptionPane.WARNING_MESSAGE
+        )
+        if (confirm == JOptionPane.YES_OPTION) {
+            try {
+                ProcessHandle.of(session.pid).ifPresent { it.destroy() }
+            } catch (e: Exception) {
+                JOptionPane.showMessageDialog(
+                    table,
+                    "Failed to kill session: ${e.message}",
+                    "Error",
+                    JOptionPane.ERROR_MESSAGE
+                )
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -261,38 +394,43 @@ class ClaudeSessionPanel(private val project: Project, parentDisposable: Disposa
 
     private inner class SessionTableModel : AbstractTableModel() {
         private var data: List<ClaudeSession> = emptyList()
-        private val columns = arrayOf("Project", "Env", "Status", "Last message", "Duration", "Started", "")
+        private val columns = arrayOf("Project", "Env", "Status", "CPU", "Last message", "Duration", "Started", "")
 
         fun updateData(sessions: List<ClaudeSession>) {
-            data = sessions.sortedWith(compareBy({ stateOrder(it.state) }, { it.projectName }))
+            data = sessions
             fireTableDataChanged()
         }
 
         fun getSession(row: Int): ClaudeSession = data[row]
-
-        private fun stateOrder(state: SessionState) = when (state) {
-            SessionState.WAITING_FOR_ACCEPT -> 0
-            SessionState.WAITING_FOR_INPUT  -> 1
-            SessionState.RUNNING            -> 2
-            SessionState.FINISHED           -> 3
-            SessionState.UNKNOWN            -> 4
-        }
 
         override fun getRowCount() = data.size
         override fun getColumnCount() = columns.size
         override fun getColumnName(col: Int) = columns[col]
         override fun isCellEditable(row: Int, col: Int) = false
 
+        override fun getColumnClass(col: Int): Class<*> = when (col) {
+            COL_PROJECT -> ClaudeSession::class.java
+            COL_ENV -> SessionEnvironment::class.java
+            COL_STATUS -> SessionState::class.java
+            COL_CPU -> java.lang.Double::class.java
+            COL_MESSAGE -> String::class.java
+            COL_DURATION -> ClaudeSession::class.java
+            COL_STARTED -> Instant::class.java
+            COL_ACTION -> ClaudeSession::class.java
+            else -> Any::class.java
+        }
+
         override fun getValueAt(row: Int, col: Int): Any {
             val s = data[row]
             return when (col) {
-                0 -> s                          // project badge
-                1 -> s.environment              // environment
-                2 -> s.state                    // status
-                3 -> s.lastAssistantMessage     // last message
-                4 -> s                          // duration (needs full session)
-                5 -> s.startedAtInstant         // started time
-                6 -> s                          // action button (needs full session)
+                COL_PROJECT -> s
+                COL_ENV -> s.environment
+                COL_STATUS -> s.state
+                COL_CPU -> s.cpuPercent
+                COL_MESSAGE -> s.lastAssistantMessage
+                COL_DURATION -> s
+                COL_STARTED -> s.startedAtInstant
+                COL_ACTION -> s
                 else -> ""
             }
         }
@@ -367,7 +505,6 @@ class ClaudeSessionPanel(private val project: Project, parentDisposable: Disposa
             label.border = JBUI.Borders.empty(0, 6)
             label.toolTipText = "<html><b>${session.projectName}</b><br>${session.cwd}<br>PID: ${session.pid}<br>Session: ${session.sessionId}</html>"
 
-            // Dim finished sessions
             if (!isSelected && session.state == SessionState.FINISHED) {
                 label.foreground = UIUtil.getLabelDisabledForeground()
             }
@@ -399,7 +536,8 @@ class ClaudeSessionPanel(private val project: Project, parentDisposable: Disposa
             }
 
             // Dim for finished sessions
-            val session = tableModel.getSession(row)
+            val modelRow = table.convertRowIndexToModel(row)
+            val session = tableModel.getSession(modelRow)
             if (!isSelected && session.state == SessionState.FINISHED) {
                 label.foreground = UIUtil.getLabelDisabledForeground()
             }
@@ -439,6 +577,32 @@ class ClaudeSessionPanel(private val project: Project, parentDisposable: Disposa
             SessionState.WAITING_FOR_ACCEPT -> JBColor(Color(195, 50, 0), Color(235, 90, 30))
             SessionState.FINISHED           -> UIUtil.getLabelDisabledForeground()
             SessionState.UNKNOWN            -> UIUtil.getLabelDisabledForeground()
+        }
+    }
+
+    private inner class CpuRenderer : DefaultTableCellRenderer() {
+        override fun getTableCellRendererComponent(
+            table: JTable, value: Any?, isSelected: Boolean, hasFocus: Boolean, row: Int, col: Int
+        ): Component {
+            val cpu = (value as? Double) ?: 0.0
+            val text = if (cpu > 0.0) "%.1f%%".format(cpu) else "\u2014"
+            val label = super.getTableCellRendererComponent(
+                table, text, isSelected, hasFocus, row, col) as JLabel
+
+            label.horizontalAlignment = SwingConstants.RIGHT
+            label.border = JBUI.Borders.empty(0, 4)
+
+            if (!isSelected) {
+                label.foreground = when {
+                    cpu > 50.0 -> JBColor(Color(195, 50, 0), Color(235, 90, 30))
+                    cpu > 10.0 -> JBColor(Color(175, 115, 0), Color(215, 155, 0))
+                    cpu > 0.0 -> JBColor(Color(0, 140, 55), Color(70, 190, 110))
+                    else -> UIUtil.getLabelDisabledForeground()
+                }
+            }
+
+            label.toolTipText = "CPU: %.1f%%".format(cpu)
+            return label
         }
     }
 
@@ -527,6 +691,25 @@ class ClaudeSessionPanel(private val project: Project, parentDisposable: Disposa
                 "Open / focus this session"
 
             return label
+        }
+    }
+
+    companion object {
+        private const val COL_PROJECT = 0
+        private const val COL_ENV = 1
+        private const val COL_STATUS = 2
+        private const val COL_CPU = 3
+        private const val COL_MESSAGE = 4
+        private const val COL_DURATION = 5
+        private const val COL_STARTED = 6
+        private const val COL_ACTION = 7
+
+        private fun stateOrder(state: SessionState) = when (state) {
+            SessionState.WAITING_FOR_ACCEPT -> 0
+            SessionState.WAITING_FOR_INPUT  -> 1
+            SessionState.RUNNING            -> 2
+            SessionState.FINISHED           -> 3
+            SessionState.UNKNOWN            -> 4
         }
     }
 }
