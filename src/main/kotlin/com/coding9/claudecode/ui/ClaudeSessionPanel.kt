@@ -400,8 +400,19 @@ class ClaudeSessionPanel(private val project: Project, parentDisposable: Disposa
         private val columns = arrayOf("Project", "Env", "Status", "Context", "CPU", "Last message", "Duration", "Started", "")
 
         fun updateData(sessions: List<ClaudeSession>) {
+            val oldSize = data.size
+            val newSize = sessions.size
             data = sessions
-            fireTableDataChanged()
+            when {
+                oldSize == newSize -> {
+                    // Same row count — update existing rows without resetting selection/scroll
+                    if (newSize > 0) fireTableRowsUpdated(0, newSize - 1)
+                }
+                else -> {
+                    // Structure changed — must do a full refresh
+                    fireTableDataChanged()
+                }
+            }
         }
 
         fun getSession(row: Int): ClaudeSession = data[row]
