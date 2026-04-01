@@ -134,12 +134,22 @@ class ClaudeSessionMonitorService : Disposable {
 
     private fun enrichSession(session: ClaudeSession) {
         val alive = ProcessHandle.of(session.pid).map { it.isAlive }.orElse(false)
+        val jsonlFile = findJsonlFile(session)
+
+        // Context usage: file size + fast line count
+        if (jsonlFile != null && jsonlFile.exists()) {
+            session.contextBytes = jsonlFile.length()
+            session.turnCount = countFileLines(jsonlFile)
+        }
+
         if (!alive) {
             session.state = SessionState.FINISHED
+            // Still read last message for finished sessions
+            val tailLines = if (jsonlFile != null) readTailLines(jsonlFile) else emptyList()
+            session.lastAssistantMessage = extractLastAssistantSnippet(tailLines)
             return
         }
 
-        val jsonlFile = findJsonlFile(session)
         val lastModified = jsonlFile?.lastModified()?.let { Instant.ofEpochMilli(it) }
 
         if (lastModified != null) session.lastActivityAt = lastModified
@@ -158,6 +168,17 @@ class ClaudeSessionMonitorService : Disposable {
 
         session.lastAssistantMessage = extractLastAssistantSnippet(tailLines)
         session.environment = detectEnvironment(session.pid)
+    }
+
+    /** Fast line count without reading full file content into memory. */
+    private fun countFileLines(file: File): Int {
+        return try {
+            file.bufferedReader().use { reader ->
+                var count = 0
+                while (reader.readLine() != null) count++
+                count
+            }
+        } catch (_: Exception) { 0 }
     }
 
     // ------------------------------------------------------------------
@@ -336,6 +357,9 @@ class ClaudeSessionMonitorService : Disposable {
         const val CPU_RUNNING_THRESHOLD = 5.0
         const val TAIL_BUFFER_BYTES = 8 * 1024
         const val MAX_PROCESS_TREE_DEPTH = 15
+
+        /** Estimated JSONL file size for a full 200K token context (~2MB with JSON overhead). */
+        const val ESTIMATED_FULL_CONTEXT_BYTES = 2_000_000L
 
         private val JETBRAINS_NAMES = listOf(
             "idea", "phpstorm", "webstorm", "pycharm", "rubymine",

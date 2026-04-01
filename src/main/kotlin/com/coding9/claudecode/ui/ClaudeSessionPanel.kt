@@ -7,6 +7,7 @@ import com.coding9.claudecode.model.ClaudeSession
 import com.coding9.claudecode.model.SessionEnvironment
 import com.coding9.claudecode.model.SessionState
 import com.coding9.claudecode.services.ClaudeSessionMonitorService
+import com.coding9.claudecode.services.ClaudeSessionMonitorService.Companion.ESTIMATED_FULL_CONTEXT_BYTES
 import com.coding9.claudecode.services.SessionsListener
 import com.intellij.icons.AllIcons
 import com.intellij.openapi.Disposable
@@ -93,20 +94,22 @@ class ClaudeSessionPanel(private val project: Project, parentDisposable: Disposa
             autoCreateRowSorter = false
             setRowSorter(rowSorter)
 
-            // Column widths: Project | Env | Status | CPU | Last message | Duration | Started | Action
-            columnModel.getColumn(COL_PROJECT).apply { minWidth = JBUI.scale(140); preferredWidth = JBUI.scale(160) }
-            columnModel.getColumn(COL_ENV).apply { minWidth = JBUI.scale(75); preferredWidth = JBUI.scale(85); maxWidth = JBUI.scale(95) }
-            columnModel.getColumn(COL_STATUS).preferredWidth = JBUI.scale(115)
-            columnModel.getColumn(COL_CPU).apply { minWidth = JBUI.scale(45); preferredWidth = JBUI.scale(55); maxWidth = JBUI.scale(65) }
-            columnModel.getColumn(COL_MESSAGE).preferredWidth = JBUI.scale(170)
-            columnModel.getColumn(COL_DURATION).preferredWidth = JBUI.scale(65)
-            columnModel.getColumn(COL_STARTED).preferredWidth = JBUI.scale(50)
-            columnModel.getColumn(COL_ACTION).apply { minWidth = JBUI.scale(65); preferredWidth = JBUI.scale(75); maxWidth = JBUI.scale(85) }
+            // Column widths: Project | Env | Status | Context | CPU | Last message | Duration | Started | Action
+            columnModel.getColumn(COL_PROJECT).apply { minWidth = JBUI.scale(130); preferredWidth = JBUI.scale(150) }
+            columnModel.getColumn(COL_ENV).apply { minWidth = JBUI.scale(70); preferredWidth = JBUI.scale(80); maxWidth = JBUI.scale(90) }
+            columnModel.getColumn(COL_STATUS).preferredWidth = JBUI.scale(110)
+            columnModel.getColumn(COL_CONTEXT).apply { minWidth = JBUI.scale(80); preferredWidth = JBUI.scale(95); maxWidth = JBUI.scale(110) }
+            columnModel.getColumn(COL_CPU).apply { minWidth = JBUI.scale(42); preferredWidth = JBUI.scale(50); maxWidth = JBUI.scale(60) }
+            columnModel.getColumn(COL_MESSAGE).preferredWidth = JBUI.scale(155)
+            columnModel.getColumn(COL_DURATION).preferredWidth = JBUI.scale(60)
+            columnModel.getColumn(COL_STARTED).preferredWidth = JBUI.scale(48)
+            columnModel.getColumn(COL_ACTION).apply { minWidth = JBUI.scale(60); preferredWidth = JBUI.scale(70); maxWidth = JBUI.scale(80) }
 
             // Custom renderers
             columnModel.getColumn(COL_PROJECT).cellRenderer = ProjectBadgeRenderer()
             columnModel.getColumn(COL_ENV).cellRenderer = EnvironmentRenderer()
             columnModel.getColumn(COL_STATUS).cellRenderer = StateTextRenderer()
+            columnModel.getColumn(COL_CONTEXT).cellRenderer = ContextBarRenderer()
             columnModel.getColumn(COL_CPU).cellRenderer = CpuRenderer()
             columnModel.getColumn(COL_MESSAGE).cellRenderer = LastMessageRenderer()
             columnModel.getColumn(COL_DURATION).cellRenderer = DurationRenderer()
@@ -394,7 +397,7 @@ class ClaudeSessionPanel(private val project: Project, parentDisposable: Disposa
 
     private inner class SessionTableModel : AbstractTableModel() {
         private var data: List<ClaudeSession> = emptyList()
-        private val columns = arrayOf("Project", "Env", "Status", "CPU", "Last message", "Duration", "Started", "")
+        private val columns = arrayOf("Project", "Env", "Status", "Context", "CPU", "Last message", "Duration", "Started", "")
 
         fun updateData(sessions: List<ClaudeSession>) {
             data = sessions
@@ -412,6 +415,7 @@ class ClaudeSessionPanel(private val project: Project, parentDisposable: Disposa
             COL_PROJECT -> ClaudeSession::class.java
             COL_ENV -> SessionEnvironment::class.java
             COL_STATUS -> SessionState::class.java
+            COL_CONTEXT -> ClaudeSession::class.java
             COL_CPU -> java.lang.Double::class.java
             COL_MESSAGE -> String::class.java
             COL_DURATION -> ClaudeSession::class.java
@@ -426,6 +430,7 @@ class ClaudeSessionPanel(private val project: Project, parentDisposable: Disposa
                 COL_PROJECT -> s
                 COL_ENV -> s.environment
                 COL_STATUS -> s.state
+                COL_CONTEXT -> s
                 COL_CPU -> s.cpuPercent
                 COL_MESSAGE -> s.lastAssistantMessage
                 COL_DURATION -> s
@@ -580,6 +585,93 @@ class ClaudeSessionPanel(private val project: Project, parentDisposable: Disposa
         }
     }
 
+    private inner class ContextBarRenderer : javax.swing.table.TableCellRenderer {
+        override fun getTableCellRendererComponent(
+            table: JTable, value: Any?, isSelected: Boolean, hasFocus: Boolean, row: Int, col: Int
+        ): Component {
+            val session = value as? ClaudeSession
+            val contextBytes = session?.contextBytes ?: 0L
+            val turnCount = session?.turnCount ?: 0
+            val percent = if (contextBytes > 0)
+                minOf(100, (contextBytes * 100 / ESTIMATED_FULL_CONTEXT_BYTES).toInt())
+            else 0
+
+            return ContextBarPanel(percent, turnCount, contextBytes, isSelected, table)
+        }
+    }
+
+    /** A compact panel that draws a colored progress bar with text overlay. */
+    private inner class ContextBarPanel(
+        private val percent: Int,
+        private val turnCount: Int,
+        private val contextBytes: Long,
+        private val isSelected: Boolean,
+        private val table: JTable
+    ) : JPanel() {
+
+        init {
+            isOpaque = true
+            border = JBUI.Borders.empty(4, 4)
+            toolTipText = buildTooltip()
+        }
+
+        private fun buildTooltip(): String {
+            val sizeKb = contextBytes / 1024
+            return "<html>Context: ~$percent%<br>" +
+                   "${turnCount} turns<br>" +
+                   "${sizeKb} KB / ${ESTIMATED_FULL_CONTEXT_BYTES / 1024} KB</html>"
+        }
+
+        override fun paintComponent(g: Graphics) {
+            super.paintComponent(g)
+            val g2 = g.create() as Graphics2D
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+
+            val insets = insets
+            val barX = insets.left
+            val barY = insets.top + JBUI.scale(2)
+            val barW = width - insets.left - insets.right
+            val barH = height - insets.top - insets.bottom - JBUI.scale(4)
+
+            // Background
+            background = if (isSelected) table.selectionBackground else table.background
+
+            // Track (empty bar)
+            val trackColor = if (isSelected) table.selectionBackground.darker() else JBColor(Color(0xE8E8E8), Color(0x3C3F41))
+            g2.color = trackColor
+            g2.fillRoundRect(barX, barY, barW, barH, 4, 4)
+
+            // Filled portion
+            if (percent > 0) {
+                val fillW = maxOf(2, barW * percent / 100)
+                g2.color = barColor(percent, isSelected)
+                g2.fillRoundRect(barX, barY, fillW, barH, 4, 4)
+            }
+
+            // Text overlay: "42% · 18t"
+            val text = if (contextBytes > 0) "$percent% \u00B7 ${turnCount}t" else "\u2014"
+            val font = g2.font.deriveFont(Font.PLAIN, JBUI.scale(10).toFloat())
+            g2.font = font
+            val fm = g2.getFontMetrics(font)
+            val textX = barX + (barW - fm.stringWidth(text)) / 2
+            val textY = barY + (barH + fm.ascent - fm.descent) / 2
+
+            g2.color = if (isSelected) table.selectionForeground
+                       else if (percent > 60) Color.WHITE
+                       else UIUtil.getLabelForeground()
+            g2.drawString(text, textX, textY)
+
+            g2.dispose()
+        }
+
+        private fun barColor(pct: Int, selected: Boolean): Color = when {
+            pct >= 85 -> JBColor(Color(0xE53935), Color(0xEF5350))  // red – near limit
+            pct >= 60 -> JBColor(Color(0xFB8C00), Color(0xFFA726))  // orange – getting full
+            pct >= 30 -> JBColor(Color(0x4285F4), Color(0x5C9DF5))  // blue – moderate
+            else      -> JBColor(Color(0x43A047), Color(0x4CAF50))  // green – plenty left
+        }
+    }
+
     private inner class CpuRenderer : DefaultTableCellRenderer() {
         override fun getTableCellRendererComponent(
             table: JTable, value: Any?, isSelected: Boolean, hasFocus: Boolean, row: Int, col: Int
@@ -698,11 +790,12 @@ class ClaudeSessionPanel(private val project: Project, parentDisposable: Disposa
         private const val COL_PROJECT = 0
         private const val COL_ENV = 1
         private const val COL_STATUS = 2
-        private const val COL_CPU = 3
-        private const val COL_MESSAGE = 4
-        private const val COL_DURATION = 5
-        private const val COL_STARTED = 6
-        private const val COL_ACTION = 7
+        private const val COL_CONTEXT = 3
+        private const val COL_CPU = 4
+        private const val COL_MESSAGE = 5
+        private const val COL_DURATION = 6
+        private const val COL_STARTED = 7
+        private const val COL_ACTION = 8
 
         private fun stateOrder(state: SessionState) = when (state) {
             SessionState.WAITING_FOR_ACCEPT -> 0
