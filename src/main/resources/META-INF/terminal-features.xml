@@ -1,0 +1,6 @@
+<idea-plugin>
+    <!-- Extensions that require the Terminal plugin -->
+    <!-- Currently all terminal interactions are done via reflection,
+         so no additional extensions are needed here. This file exists
+         to properly declare the optional dependency. -->
+</idea-plugin>

@@ -60,7 +60,7 @@ class ClaudeSessionMonitorService : Disposable {
             return
         }
         started = true
-        scheduledFuture = executor.scheduleWithFixedDelay(::safePoll, 0, 2, TimeUnit.SECONDS)
+        scheduledFuture = executor.scheduleWithFixedDelay(::safePoll, 0, POLL_INTERVAL_SECONDS, TimeUnit.SECONDS)
     }
 
     override fun dispose() {
@@ -127,7 +127,7 @@ class ClaudeSessionMonitorService : Disposable {
             val startedAt = json.get("startedAt")?.asLong ?: 0L
             ClaudeSession(pid = pid, sessionId = sessionId, cwd = cwd, startedAt = startedAt)
         } catch (e: Exception) {
-            log.debug("Could not parse session file ${file.name}: ${e.message}")
+            log.warn("Could not parse session file ${file.name}: ${e.message}")
             null
         }
     }
@@ -148,13 +148,15 @@ class ClaudeSessionMonitorService : Disposable {
             Instant.now().epochSecond - lastModified.epochSecond
         else Long.MAX_VALUE
 
+        // Read tail lines once and reuse for both state detection and last message
+        val tailLines = if (jsonlFile != null) readTailLines(jsonlFile) else emptyList()
+
         session.state = when {
-            secondsSinceActivity < 3 || session.cpuPercent > 5.0 -> SessionState.RUNNING
-            else -> determineWaitState(jsonlFile)
+            secondsSinceActivity < ACTIVITY_THRESHOLD_SECONDS || session.cpuPercent > CPU_RUNNING_THRESHOLD -> SessionState.RUNNING
+            else -> determineWaitState(tailLines)
         }
 
-        jsonlFile?.let { session.lastAssistantMessage = readLastAssistantSnippet(it) }
-
+        session.lastAssistantMessage = extractLastAssistantSnippet(tailLines)
         session.environment = detectEnvironment(session.pid)
     }
 
@@ -162,13 +164,11 @@ class ClaudeSessionMonitorService : Disposable {
     // JSONL helpers — read only the tail to avoid loading entire histories
     // ------------------------------------------------------------------
 
-    private val TAIL_BUFFER = 8 * 1024 // 8 KB is enough for several JSONL lines
-
     /** Read the last few KB of a file and return the non-blank lines. */
     private fun readTailLines(file: File): List<String> {
         val size = file.length()
         if (size == 0L) return emptyList()
-        val readSize = minOf(TAIL_BUFFER.toLong(), size).toInt()
+        val readSize = minOf(TAIL_BUFFER_BYTES.toLong(), size).toInt()
         val buffer = ByteArray(readSize)
         try {
             RandomAccessFile(file, "r").use { raf ->
@@ -182,9 +182,8 @@ class ClaudeSessionMonitorService : Disposable {
         return String(buffer, Charsets.UTF_8).lines().filter { it.isNotBlank() }
     }
 
-    private fun determineWaitState(jsonlFile: File?): SessionState {
-        if (jsonlFile == null) return SessionState.WAITING_FOR_INPUT
-        val lastLine = readTailLines(jsonlFile).lastOrNull() ?: return SessionState.WAITING_FOR_INPUT
+    private fun determineWaitState(tailLines: List<String>): SessionState {
+        val lastLine = tailLines.lastOrNull() ?: return SessionState.WAITING_FOR_INPUT
         return try {
             val entry = gson.fromJson(lastLine, JsonObject::class.java)
             val message = entry.getAsJsonObject("message") ?: return SessionState.WAITING_FOR_INPUT
@@ -203,13 +202,12 @@ class ClaudeSessionMonitorService : Disposable {
         }
     }
 
-    private fun readLastAssistantSnippet(jsonlFile: File): String {
-        val lines = readTailLines(jsonlFile)
-        val lastAssistantLine = lines.lastOrNull { line ->
+    private fun extractLastAssistantSnippet(tailLines: List<String>): String {
+        val lastAssistantLine = tailLines.lastOrNull { line ->
             try {
                 gson.fromJson(line, JsonObject::class.java)
                     .getAsJsonObject("message")?.get("role")?.asString == "assistant"
-            } catch (e: Exception) { false }
+            } catch (_: Exception) { false }
         } ?: return ""
 
         return try {
@@ -222,18 +220,12 @@ class ClaudeSessionMonitorService : Disposable {
                 "tool_use" -> "Using tool: ${content.get("name")?.asString ?: "unknown"}"
                 else -> ""
             }
-        } catch (e: Exception) { "" }
+        } catch (_: Exception) { "" }
     }
 
     // ------------------------------------------------------------------
     // Environment detection – walk the process tree to find JetBrains
     // ------------------------------------------------------------------
-
-    private val JETBRAINS_NAMES = listOf(
-        "idea", "phpstorm", "webstorm", "pycharm", "rubymine",
-        "goland", "clion", "rider", "datagrip", "appcode", "fleet",
-        "intellij", "android-studio", "studio"
-    )
 
     private fun detectEnvironment(pid: Long): SessionEnvironment {
         return try {
@@ -241,7 +233,7 @@ class ClaudeSessionMonitorService : Disposable {
             if (!handle.isAlive) return SessionEnvironment.UNKNOWN
 
             var depth = 0
-            while (depth < 15) {
+            while (depth < MAX_PROCESS_TREE_DEPTH) {
                 val parent = handle.parent().orElse(null) ?: break
                 val command = parent.info().command().orElse("")
                 if (isJetBrainsProcess(command)) return SessionEnvironment.JETBRAINS_TERMINAL
@@ -288,7 +280,9 @@ class ClaudeSessionMonitorService : Disposable {
         if (pids.isEmpty()) return emptyMap()
         return try {
             val cmd = listOf("ps", "-p", pids.joinToString(","), "-o", "pid=,%cpu=")
-            val output = ProcessBuilder(cmd).start().inputStream.bufferedReader().readText()
+            val process = ProcessBuilder(cmd).start()
+            val output = process.inputStream.bufferedReader().use { it.readText() }
+            process.waitFor(5, TimeUnit.SECONDS)
             output.lines()
                 .filter { it.isNotBlank() }
                 .mapNotNull { line ->
@@ -297,7 +291,7 @@ class ClaudeSessionMonitorService : Disposable {
                     else null
                 }
                 .toMap()
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             emptyMap()
         }
     }
@@ -337,6 +331,18 @@ class ClaudeSessionMonitorService : Disposable {
     }
 
     companion object {
+        const val POLL_INTERVAL_SECONDS = 2L
+        const val ACTIVITY_THRESHOLD_SECONDS = 3
+        const val CPU_RUNNING_THRESHOLD = 5.0
+        const val TAIL_BUFFER_BYTES = 8 * 1024
+        const val MAX_PROCESS_TREE_DEPTH = 15
+
+        private val JETBRAINS_NAMES = listOf(
+            "idea", "phpstorm", "webstorm", "pycharm", "rubymine",
+            "goland", "clion", "rider", "datagrip", "appcode", "fleet",
+            "intellij", "android-studio", "studio"
+        )
+
         fun getInstance(): ClaudeSessionMonitorService =
             ApplicationManager.getApplication().getService(ClaudeSessionMonitorService::class.java)
     }

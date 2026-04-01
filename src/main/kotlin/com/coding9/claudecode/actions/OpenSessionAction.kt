@@ -12,11 +12,11 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.project.ProjectManager
 import com.intellij.openapi.wm.ToolWindowManager
 import com.intellij.openapi.wm.WindowManager
-import com.intellij.ui.JBColor
 import com.intellij.util.ui.JBUI
 import java.awt.*
 import java.awt.datatransfer.StringSelection
 import java.io.File
+import java.util.concurrent.TimeUnit
 import javax.swing.*
 
 /**
@@ -36,6 +36,8 @@ import javax.swing.*
 object OpenSessionAction {
 
     private val log = thisLogger()
+    private val IS_MAC = System.getProperty("os.name", "").lowercase().contains("mac")
+    private val IS_WINDOWS = System.getProperty("os.name", "").lowercase().contains("win")
 
     fun openSession(callerProject: Project, session: ClaudeSession) {
         if (session.state == SessionState.FINISHED) {
@@ -44,13 +46,10 @@ object OpenSessionAction {
         }
 
         // --- Step 1: focus the real terminal window (iTerm2 / Terminal.app) ---
-        if (focusExternalTerminal(session)) return
+        if (IS_MAC && focusExternalTerminal(session)) return
 
         // --- Step 2: maybe it's running inside the IDE's built-in terminal ---
-        val openProject = ProjectManager.getInstance().openProjects.firstOrNull { project ->
-            val base = project.basePath ?: return@firstOrNull false
-            File(base).canonicalPath == File(session.cwd).canonicalPath
-        }
+        val openProject = findOpenProject(session.cwd)
 
         if (openProject != null) {
             focusProjectTerminal(openProject, session)
@@ -163,32 +162,47 @@ object OpenSessionAction {
     // =========================================================================
 
     private fun resumeInExternalTerminal(session: ClaudeSession) {
-        val resumeCmd = "cd '${session.cwd}' && claude --resume '${session.sessionId}'"
-        val os = System.getProperty("os.name", "").lowercase()
+        val escapedCwd = session.cwd.replace("'", "\\'")
+        val resumeCmd = "cd '$escapedCwd' && claude --resume '${session.sessionId}'"
 
-        if (os.contains("mac")) {
-            val script = """
-                tell application "Terminal"
-                    do script "$resumeCmd"
-                    activate
-                end tell
-            """.trimIndent()
-            ProcessBuilder("osascript", "-e", script).start()
-        } else {
-            // Linux: try common terminal emulators
-            val terminals = listOf(
-                listOf("gnome-terminal", "--", "bash", "-c", "$resumeCmd; exec bash"),
-                listOf("konsole", "-e", "bash", "-c", "$resumeCmd; exec bash"),
-                listOf("xterm", "-e", "bash", "-c", "$resumeCmd; exec bash"),
-                listOf("x-terminal-emulator", "-e", "bash", "-c", "$resumeCmd; exec bash")
-            )
-            for (cmd in terminals) {
-                try {
-                    ProcessBuilder(cmd).start()
-                    return
-                } catch (_: Exception) { /* try next */ }
+        try {
+            when {
+                IS_MAC -> {
+                    val script = """
+                        tell application "Terminal"
+                            do script "$resumeCmd"
+                            activate
+                        end tell
+                    """.trimIndent()
+                    ProcessBuilder("osascript", "-e", script).start()
+                }
+                IS_WINDOWS -> {
+                    try {
+                        ProcessBuilder("wt", "-d", session.cwd, "cmd", "/c", "claude --resume ${session.sessionId}").start()
+                    } catch (_: Exception) {
+                        ProcessBuilder("cmd", "/c", "start", "cmd", "/k", "cd /d \"${session.cwd}\" && claude --resume ${session.sessionId}").start()
+                    }
+                }
+                else -> {
+                    // Linux: try common terminal emulators
+                    val terminals = listOf(
+                        listOf("gnome-terminal", "--", "bash", "-c", "$resumeCmd; exec bash"),
+                        listOf("konsole", "-e", "bash", "-c", "$resumeCmd; exec bash"),
+                        listOf("xfce4-terminal", "-e", "bash -c '$resumeCmd; exec bash'"),
+                        listOf("xterm", "-e", "bash", "-c", "$resumeCmd; exec bash"),
+                        listOf("x-terminal-emulator", "-e", "bash", "-c", "$resumeCmd; exec bash")
+                    )
+                    for (cmd in terminals) {
+                        try {
+                            ProcessBuilder(cmd).start()
+                            return
+                        } catch (_: Exception) { /* try next */ }
+                    }
+                    log.warn("Could not find a terminal emulator to resume session")
+                }
             }
-            log.warn("Could not find a terminal emulator to resume session")
+        } catch (e: Exception) {
+            log.warn("Failed to launch external terminal for resume", e)
         }
     }
 
@@ -198,10 +212,7 @@ object OpenSessionAction {
 
     private fun resumeInJetBrains(callerProject: Project, session: ClaudeSession) {
         // Check if the project is already open in any IDE window
-        val openProject = ProjectManager.getInstance().openProjects.firstOrNull { project ->
-            val base = project.basePath ?: return@firstOrNull false
-            try { File(base).canonicalPath == File(session.cwd).canonicalPath } catch (_: Exception) { false }
-        }
+        val openProject = findOpenProject(session.cwd)
 
         if (openProject != null) {
             createResumeTerminalTab(openProject, session)
@@ -251,8 +262,7 @@ object OpenSessionAction {
             "Android Studio" to "studio"
         )
 
-        val os = System.getProperty("os.name", "").lowercase()
-        if (os.contains("mac")) {
+        if (IS_MAC) {
             // macOS: check /Applications for .app bundles
             val appsDir = File("/Applications")
             if (appsDir.isDirectory) {
@@ -268,12 +278,14 @@ object OpenSessionAction {
         }
 
         // Also check PATH for CLI launchers (Linux + macOS Toolbox)
+        val whichCmd = if (IS_WINDOWS) "where" else "which"
         for ((name, cmd) in knownApps) {
             if (ides.any { it.command == cmd }) continue
             try {
-                val result = ProcessBuilder("which", cmd).start()
-                val path = result.inputStream.bufferedReader().readText().trim()
-                if (result.waitFor() == 0 && path.isNotEmpty()) {
+                val result = ProcessBuilder(whichCmd, cmd).start()
+                val path = result.inputStream.bufferedReader().use { it.readText() }.trim()
+                result.waitFor(3, TimeUnit.SECONDS)
+                if (result.exitValue() == 0 && path.isNotEmpty()) {
                     ides.add(JetBrainsIde(name, cmd, null))
                 }
             } catch (_: Exception) { /* not found */ }
@@ -286,13 +298,14 @@ object OpenSessionAction {
         val resumeCmd = "claude --resume '${session.sessionId}'"
 
         try {
-            if (ide.appPath != null) {
+            val process = if (ide.appPath != null) {
                 // macOS: open -a "AppPath" <projectDir>
                 ProcessBuilder("open", "-a", ide.appPath, session.cwd).start()
             } else {
                 // CLI launcher: <command> <projectDir>
                 ProcessBuilder(ide.command, session.cwd).start()
             }
+            process.waitFor(10, TimeUnit.SECONDS)
 
             // Copy the resume command to clipboard so the user can paste it in the terminal
             CopyPasteManager.getInstance().setContents(StringSelection(resumeCmd))
@@ -314,7 +327,7 @@ object OpenSessionAction {
         ApplicationManager.getApplication().invokeLater {
             try {
                 ProjectManager.getInstance().loadAndOpenProject(session.cwd)?.let { newProject ->
-                    // Wait a bit for the project to initialize, then create a terminal tab
+                    // Use a Swing Timer (auto-stops since isRepeats=false) to wait for project init
                     Timer(2000) { createResumeTerminalTab(newProject, session) }.apply {
                         isRepeats = false
                         start()
@@ -373,7 +386,6 @@ object OpenSessionAction {
                 notify(project, "Resume command copied to clipboard:\n$command", NotificationType.INFORMATION)
             }
         } catch (_: ClassNotFoundException) {
-            // Terminal plugin not available
             CopyPasteManager.getInstance().setContents(StringSelection(command))
             notify(project, "Terminal plugin not found. Resume command copied to clipboard:\n$command", NotificationType.INFORMATION)
         } catch (e: Exception) {
@@ -484,8 +496,9 @@ object OpenSessionAction {
     private fun isClaudeSession(shellPid: Long, claudePid: Long): Boolean {
         if (shellPid == claudePid) return true
         return try {
-            val output = ProcessBuilder("pgrep", "-P", shellPid.toString())
-                .start().inputStream.bufferedReader().readText()
+            val process = ProcessBuilder("pgrep", "-P", shellPid.toString()).start()
+            val output = process.inputStream.bufferedReader().use { it.readText() }
+            process.waitFor(3, TimeUnit.SECONDS)
             output.lines().mapNotNull { it.trim().toLongOrNull() }.any { childPid ->
                 childPid == claudePid || isClaudeSession(childPid, claudePid)
             }
@@ -493,23 +506,24 @@ object OpenSessionAction {
     }
 
     // =========================================================================
-    // Focus external terminal window via AppleScript
+    // Focus external terminal window via AppleScript (macOS only)
     // =========================================================================
 
     private fun focusExternalTerminal(session: ClaudeSession): Boolean {
         val tty = getProcessTty(session.pid) ?: return false
-        return focusITerm2(session.pid, tty) || focusTerminalApp(session.pid, tty)
+        return focusITerm2(tty) || focusTerminalApp(tty)
     }
 
     private fun getProcessTty(pid: Long): String? {
         return try {
-            val output = ProcessBuilder("ps", "-p", pid.toString(), "-o", "tty=")
-                .start().inputStream.bufferedReader().readText().trim()
+            val process = ProcessBuilder("ps", "-p", pid.toString(), "-o", "tty=").start()
+            val output = process.inputStream.bufferedReader().use { it.readText() }.trim()
+            process.waitFor(3, TimeUnit.SECONDS)
             output.ifEmpty { null }
         } catch (_: Exception) { null }
     }
 
-    private fun focusITerm2(pid: Long, tty: String): Boolean {
+    private fun focusITerm2(tty: String): Boolean {
         val script = """
             tell application "System Events"
                 if exists (processes where name is "iTerm2") then
@@ -534,7 +548,7 @@ object OpenSessionAction {
         return runAppleScript(script)
     }
 
-    private fun focusTerminalApp(pid: Long, tty: String): Boolean {
+    private fun focusTerminalApp(tty: String): Boolean {
         val script = """
             tell application "System Events"
                 if exists (processes where name is "Terminal") then
@@ -560,8 +574,9 @@ object OpenSessionAction {
     private fun runAppleScript(script: String): Boolean {
         return try {
             val process = ProcessBuilder("osascript", "-e", script).start()
-            val result = process.inputStream.bufferedReader().readText().trim()
-            process.waitFor() == 0 && result == "true"
+            val result = process.inputStream.bufferedReader().use { it.readText() }.trim()
+            process.waitFor(5, TimeUnit.SECONDS)
+            process.exitValue() == 0 && result == "true"
         } catch (e: Exception) {
             log.debug("AppleScript failed", e)
             false
@@ -571,6 +586,13 @@ object OpenSessionAction {
     // =========================================================================
     // Helpers
     // =========================================================================
+
+    private fun findOpenProject(cwd: String): Project? {
+        return ProjectManager.getInstance().openProjects.firstOrNull { project ->
+            val base = project.basePath ?: return@firstOrNull false
+            try { File(base).canonicalPath == File(cwd).canonicalPath } catch (_: Exception) { false }
+        }
+    }
 
     private fun notify(project: Project, message: String, type: NotificationType) {
         NotificationGroupManager.getInstance()
