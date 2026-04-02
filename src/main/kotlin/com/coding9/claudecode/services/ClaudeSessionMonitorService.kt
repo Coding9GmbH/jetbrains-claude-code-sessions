@@ -6,12 +6,16 @@ import com.coding9.claudecode.model.SessionState
 import com.google.gson.Gson
 import com.google.gson.JsonObject
 import com.google.gson.JsonSyntaxException
+import com.coding9.claudecode.actions.OpenSessionAction
 import com.intellij.notification.NotificationGroupManager
 import com.intellij.notification.NotificationType
+import com.intellij.openapi.actionSystem.AnAction
+import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.thisLogger
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.project.ProjectManager
 import java.io.File
 import java.io.RandomAccessFile
 import java.nio.file.Files
@@ -409,13 +413,35 @@ class ClaudeSessionMonitorService : Disposable {
     private fun notify(session: ClaudeSession, message: String, type: NotificationType) {
         ApplicationManager.getApplication().invokeLater {
             try {
-                NotificationGroupManager.getInstance()
+                val notification = NotificationGroupManager.getInstance()
                     .getNotificationGroup("Claude Code Sessions")
-                    ?.createNotification(title = session.projectName, content = message, type = type)
-                    ?.notify(null)
+                    ?.createNotification(
+                        title = session.projectName,
+                        content = message,
+                        type = type
+                    ) ?: return@invokeLater
+
+                notification.addAction(object : AnAction("Open") {
+                    override fun actionPerformed(e: AnActionEvent) {
+                        notification.expire()
+                        val project = findProjectForSession(session)
+                            ?: ProjectManager.getInstance().openProjects.firstOrNull()
+                            ?: return
+                        OpenSessionAction.openSession(project, session)
+                    }
+                })
+
+                notification.notify(findProjectForSession(session))
             } catch (e: Exception) {
                 log.debug("Notification failed: ${e.message}")
             }
+        }
+    }
+
+    private fun findProjectForSession(session: ClaudeSession): com.intellij.openapi.project.Project? {
+        return ProjectManager.getInstance().openProjects.firstOrNull { project ->
+            val base = project.basePath ?: return@firstOrNull false
+            try { File(base).canonicalPath == File(session.cwd).canonicalPath } catch (_: Exception) { false }
         }
     }
 
@@ -485,9 +511,10 @@ class ClaudeSessionMonitorService : Disposable {
             val segment = parts.subList(idx, end).joinToString("-")
             val candidate = "$current/$segment"
             if (end == parts.size) {
-                // Last segment(s) — accept if parent exists or if full path exists
-                val parentExists = current.isEmpty() || File(current).isDirectory
-                if (parentExists) return candidate
+                // Last segment(s) — only accept if we already have a valid parent directory.
+                // Requiring current.isNotEmpty() prevents greedily accepting the full encoded
+                // string (e.g. "/Users-alex-Work-proj") at the root level.
+                if (current.isNotEmpty() && File(current).isDirectory) return candidate
             } else if (File(candidate).isDirectory) {
                 val result = tryReconstructPath(parts, candidate, end)
                 if (result != null) return result
