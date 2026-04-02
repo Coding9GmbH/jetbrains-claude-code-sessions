@@ -78,13 +78,52 @@ class StartSessionAction : AnAction(
     }
 
     private fun launchExternalTerminal(basePath: String) {
-        // macOS: open a new Terminal.app window in the given directory
+        val os = System.getProperty("os.name", "").lowercase()
+        try {
+            when {
+                os.contains("mac") -> launchTerminalMacOS(basePath)
+                os.contains("win") -> launchTerminalWindows(basePath)
+                else -> launchTerminalLinux(basePath)
+            }
+        } catch (e: Exception) {
+            log.warn("Could not launch external terminal on $os", e)
+        }
+    }
+
+    private fun launchTerminalMacOS(basePath: String) {
         val script = """
             tell application "Terminal"
-                do script "cd '$basePath' && claude"
+                do script "cd '${basePath.replace("'", "\\'")}' && claude"
                 activate
             end tell
         """.trimIndent()
         ProcessBuilder("osascript", "-e", script).start()
+    }
+
+    private fun launchTerminalLinux(basePath: String) {
+        val cmd = "cd '${basePath.replace("'", "\\'")}' && claude"
+        val terminals = listOf(
+            listOf("gnome-terminal", "--", "bash", "-c", "$cmd; exec bash"),
+            listOf("konsole", "-e", "bash", "-c", "$cmd; exec bash"),
+            listOf("xfce4-terminal", "-e", "bash -c '$cmd; exec bash'"),
+            listOf("xterm", "-e", "bash", "-c", "$cmd; exec bash"),
+            listOf("x-terminal-emulator", "-e", "bash", "-c", "$cmd; exec bash")
+        )
+        for (terminal in terminals) {
+            try {
+                ProcessBuilder(terminal).directory(java.io.File(basePath)).start()
+                return
+            } catch (_: Exception) { /* try next */ }
+        }
+        log.warn("Could not find a terminal emulator on Linux")
+    }
+
+    private fun launchTerminalWindows(basePath: String) {
+        // Windows Terminal (wt) or fallback to cmd
+        try {
+            ProcessBuilder("wt", "-d", basePath, "cmd", "/c", "claude").start()
+        } catch (_: Exception) {
+            ProcessBuilder("cmd", "/c", "start", "cmd", "/k", "cd /d \"$basePath\" && claude").start()
+        }
     }
 }

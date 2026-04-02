@@ -1,6 +1,7 @@
 package com.coding9.claudecode.services
 
 import com.coding9.claudecode.model.ClaudeSession
+import com.coding9.claudecode.model.SessionEnvironment
 import com.coding9.claudecode.model.SessionState
 import com.google.gson.Gson
 import com.google.gson.JsonObject
@@ -14,6 +15,7 @@ import com.intellij.openapi.Disposable
 import java.io.File
 import java.io.RandomAccessFile
 import java.time.Instant
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
@@ -40,6 +42,17 @@ class ClaudeSessionMonitorService : Disposable {
     // Only accessed from the single executor thread — no synchronization needed
     private var lastKnownSessions: Map<Long, SessionState> = emptyMap()
 
+    // Caches — accessed only from the single executor thread
+    private data class LineCountEntry(val lastModified: Long, val lineCount: Int)
+    private data class EnvironmentEntry(val environment: SessionEnvironment, val timestamp: Long)
+    private data class SessionFileEntry(val lastModified: Long, val session: ClaudeSession?)
+    private data class JsonlFileEntry(val path: File?, val timestamp: Long)
+
+    private val lineCountCache = HashMap<String, LineCountEntry>()           // filePath -> cached count
+    private val environmentCache = HashMap<Long, EnvironmentEntry>()          // pid -> cached env
+    private val sessionFileCache = HashMap<String, SessionFileEntry>()        // filePath -> cached parse
+    private val jsonlFileCache = HashMap<String, JsonlFileEntry>()            // sessionId -> cached path
+
     @Volatile private var started = false
     @Volatile private var scheduledFuture: ScheduledFuture<*>? = null
 
@@ -59,7 +72,7 @@ class ClaudeSessionMonitorService : Disposable {
             return
         }
         started = true
-        scheduledFuture = executor.scheduleWithFixedDelay(::safePoll, 0, 2, TimeUnit.SECONDS)
+        scheduledFuture = executor.scheduleWithFixedDelay(::safePoll, 0, POLL_INTERVAL_SECONDS, TimeUnit.SECONDS)
     }
 
     override fun dispose() {
@@ -90,6 +103,13 @@ class ClaudeSessionMonitorService : Disposable {
         val fresh = loadSessions()
         sessions = fresh
         detectStateChanges(fresh)
+
+        // Evict cache entries for PIDs/sessions that no longer exist
+        val activePids = fresh.map { it.pid }.toSet()
+        val activeSessionIds = fresh.map { it.sessionId }.toSet()
+        environmentCache.keys.removeAll { it !in activePids }
+        jsonlFileCache.keys.removeAll { it !in activeSessionIds }
+
         ApplicationManager.getApplication().invokeLater {
             listeners.forEach { it.onSessions(fresh) }
         }
@@ -118,7 +138,14 @@ class ClaudeSessionMonitorService : Disposable {
     }
 
     private fun parseSessionFile(file: File): ClaudeSession? {
-        return try {
+        val path = file.absolutePath
+        val lastMod = file.lastModified()
+        val cached = sessionFileCache[path]
+        if (cached != null && cached.lastModified == lastMod) {
+            // Return a copy so enrichSession can mutate it independently
+            return cached.session?.copy()
+        }
+        val result = try {
             val json = gson.fromJson(file.readText(), JsonObject::class.java)
             val pid = json.get("pid")?.asLong ?: return null
             val sessionId = json.get("sessionId")?.asString ?: return null
@@ -126,19 +153,31 @@ class ClaudeSessionMonitorService : Disposable {
             val startedAt = json.get("startedAt")?.asLong ?: 0L
             ClaudeSession(pid = pid, sessionId = sessionId, cwd = cwd, startedAt = startedAt)
         } catch (e: Exception) {
-            log.debug("Could not parse session file ${file.name}: ${e.message}")
+            log.warn("Could not parse session file ${file.name}: ${e.message}")
             null
         }
+        sessionFileCache[path] = SessionFileEntry(lastMod, result)
+        return result?.copy()
     }
 
     private fun enrichSession(session: ClaudeSession) {
         val alive = ProcessHandle.of(session.pid).map { it.isAlive }.orElse(false)
+        val jsonlFile = findJsonlFile(session)
+
+        // Context usage: file size + fast line count
+        if (jsonlFile != null && jsonlFile.exists()) {
+            session.contextBytes = jsonlFile.length()
+            session.turnCount = countFileLines(jsonlFile)
+        }
+
         if (!alive) {
             session.state = SessionState.FINISHED
+            // Still read last message for finished sessions
+            val tailLines = if (jsonlFile != null) readTailLines(jsonlFile) else emptyList()
+            session.lastAssistantMessage = extractLastAssistantSnippet(tailLines)
             return
         }
 
-        val jsonlFile = findJsonlFile(session)
         val lastModified = jsonlFile?.lastModified()?.let { Instant.ofEpochMilli(it) }
 
         if (lastModified != null) session.lastActivityAt = lastModified
@@ -147,25 +186,45 @@ class ClaudeSessionMonitorService : Disposable {
             Instant.now().epochSecond - lastModified.epochSecond
         else Long.MAX_VALUE
 
+        // Read tail lines once and reuse for both state detection and last message
+        val tailLines = if (jsonlFile != null) readTailLines(jsonlFile) else emptyList()
+
         session.state = when {
-            secondsSinceActivity < 3 || session.cpuPercent > 5.0 -> SessionState.RUNNING
-            else -> determineWaitState(jsonlFile)
+            secondsSinceActivity < ACTIVITY_THRESHOLD_SECONDS || session.cpuPercent > CPU_RUNNING_THRESHOLD -> SessionState.RUNNING
+            else -> determineWaitState(tailLines)
         }
 
-        jsonlFile?.let { session.lastAssistantMessage = readLastAssistantSnippet(it) }
+        session.lastAssistantMessage = extractLastAssistantSnippet(tailLines)
+        session.environment = detectEnvironment(session.pid)
+    }
+
+    /** Line count cached by file modification time — avoids re-reading the entire file every poll. */
+    private fun countFileLines(file: File): Int {
+        val path = file.absolutePath
+        val lastMod = file.lastModified()
+        val cached = lineCountCache[path]
+        if (cached != null && cached.lastModified == lastMod) return cached.lineCount
+
+        val count = try {
+            file.bufferedReader().use { reader ->
+                var c = 0
+                while (reader.readLine() != null) c++
+                c
+            }
+        } catch (_: Exception) { 0 }
+        lineCountCache[path] = LineCountEntry(lastMod, count)
+        return count
     }
 
     // ------------------------------------------------------------------
     // JSONL helpers — read only the tail to avoid loading entire histories
     // ------------------------------------------------------------------
 
-    private val TAIL_BUFFER = 8 * 1024 // 8 KB is enough for several JSONL lines
-
     /** Read the last few KB of a file and return the non-blank lines. */
     private fun readTailLines(file: File): List<String> {
         val size = file.length()
         if (size == 0L) return emptyList()
-        val readSize = minOf(TAIL_BUFFER.toLong(), size).toInt()
+        val readSize = minOf(TAIL_BUFFER_BYTES.toLong(), size).toInt()
         val buffer = ByteArray(readSize)
         try {
             RandomAccessFile(file, "r").use { raf ->
@@ -179,9 +238,8 @@ class ClaudeSessionMonitorService : Disposable {
         return String(buffer, Charsets.UTF_8).lines().filter { it.isNotBlank() }
     }
 
-    private fun determineWaitState(jsonlFile: File?): SessionState {
-        if (jsonlFile == null) return SessionState.WAITING_FOR_INPUT
-        val lastLine = readTailLines(jsonlFile).lastOrNull() ?: return SessionState.WAITING_FOR_INPUT
+    private fun determineWaitState(tailLines: List<String>): SessionState {
+        val lastLine = tailLines.lastOrNull() ?: return SessionState.WAITING_FOR_INPUT
         return try {
             val entry = gson.fromJson(lastLine, JsonObject::class.java)
             val message = entry.getAsJsonObject("message") ?: return SessionState.WAITING_FOR_INPUT
@@ -200,13 +258,12 @@ class ClaudeSessionMonitorService : Disposable {
         }
     }
 
-    private fun readLastAssistantSnippet(jsonlFile: File): String {
-        val lines = readTailLines(jsonlFile)
-        val lastAssistantLine = lines.lastOrNull { line ->
+    private fun extractLastAssistantSnippet(tailLines: List<String>): String {
+        val lastAssistantLine = tailLines.lastOrNull { line ->
             try {
                 gson.fromJson(line, JsonObject::class.java)
                     .getAsJsonObject("message")?.get("role")?.asString == "assistant"
-            } catch (e: Exception) { false }
+            } catch (_: Exception) { false }
         } ?: return ""
 
         return try {
@@ -219,7 +276,44 @@ class ClaudeSessionMonitorService : Disposable {
                 "tool_use" -> "Using tool: ${content.get("name")?.asString ?: "unknown"}"
                 else -> ""
             }
-        } catch (e: Exception) { "" }
+        } catch (_: Exception) { "" }
+    }
+
+    // ------------------------------------------------------------------
+    // Environment detection – walk the process tree to find JetBrains
+    // ------------------------------------------------------------------
+
+    private fun detectEnvironment(pid: Long): SessionEnvironment {
+        val now = System.currentTimeMillis()
+        val cached = environmentCache[pid]
+        if (cached != null && (now - cached.timestamp) < ENV_CACHE_TTL_MS) return cached.environment
+
+        val result = try {
+            var handle: ProcessHandle = ProcessHandle.of(pid).orElse(null) ?: return SessionEnvironment.UNKNOWN
+            if (!handle.isAlive) return SessionEnvironment.UNKNOWN
+
+            var depth = 0
+            while (depth < MAX_PROCESS_TREE_DEPTH) {
+                val parent = handle.parent().orElse(null) ?: break
+                val command = parent.info().command().orElse("")
+                if (isJetBrainsProcess(command)) {
+                    environmentCache[pid] = EnvironmentEntry(SessionEnvironment.JETBRAINS_TERMINAL, now)
+                    return SessionEnvironment.JETBRAINS_TERMINAL
+                }
+                handle = parent
+                depth++
+            }
+            SessionEnvironment.EXTERNAL_TERMINAL
+        } catch (_: Exception) {
+            SessionEnvironment.UNKNOWN
+        }
+        environmentCache[pid] = EnvironmentEntry(result, now)
+        return result
+    }
+
+    private fun isJetBrainsProcess(command: String): Boolean {
+        val lower = command.lowercase()
+        return JETBRAINS_NAMES.any { lower.contains(it) }
     }
 
     // ------------------------------------------------------------------
@@ -227,15 +321,25 @@ class ClaudeSessionMonitorService : Disposable {
     // ------------------------------------------------------------------
 
     private fun findJsonlFile(session: ClaudeSession): File? {
+        val now = System.currentTimeMillis()
+        val cached = jsonlFileCache[session.sessionId]
+        // Re-validate cached path: still exists? If yes, reuse. TTL for null results to retry.
+        if (cached != null) {
+            if (cached.path != null && cached.path.exists()) return cached.path
+            if (cached.path == null && (now - cached.timestamp) < JSONL_CACHE_TTL_MS) return null
+        }
+
         val projectsDir = File(System.getProperty("user.home"), ".claude/projects")
         val projectDir = File(projectsDir, session.encodedProjectPath).takeIf { it.isDirectory }
             ?: projectsDir.listFiles()?.firstOrNull { dir ->
                 dir.isDirectory && cwdMatchesDir(session.cwd, dir.name)
             }
-            ?: return null
+            ?: run { jsonlFileCache[session.sessionId] = JsonlFileEntry(null, now); return null }
         val direct = File(projectDir, "${session.sessionId}.jsonl")
-        if (direct.exists()) return direct
-        return projectDir.listFiles { f -> f.extension == "jsonl" }?.maxByOrNull { it.lastModified() }
+        val result = if (direct.exists()) direct
+            else projectDir.listFiles { f -> f.extension == "jsonl" }?.maxByOrNull { it.lastModified() }
+        jsonlFileCache[session.sessionId] = JsonlFileEntry(result, now)
+        return result
     }
 
     private fun cwdMatchesDir(cwd: String, dirName: String): Boolean {
@@ -251,7 +355,13 @@ class ClaudeSessionMonitorService : Disposable {
         if (pids.isEmpty()) return emptyMap()
         return try {
             val cmd = listOf("ps", "-p", pids.joinToString(","), "-o", "pid=,%cpu=")
-            val output = ProcessBuilder(cmd).start().inputStream.bufferedReader().readText()
+            val process = ProcessBuilder(cmd).redirectErrorStream(true).start()
+            // Read output BEFORE waitFor to avoid deadlock on full pipe buffer
+            val output = process.inputStream.bufferedReader().use { it.readText() }
+            if (!process.waitFor(5, TimeUnit.SECONDS)) {
+                process.destroyForcibly()
+                return emptyMap()
+            }
             output.lines()
                 .filter { it.isNotBlank() }
                 .mapNotNull { line ->
@@ -260,7 +370,7 @@ class ClaudeSessionMonitorService : Disposable {
                     else null
                 }
                 .toMap()
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             emptyMap()
         }
     }
@@ -300,6 +410,23 @@ class ClaudeSessionMonitorService : Disposable {
     }
 
     companion object {
+        const val POLL_INTERVAL_SECONDS = 2L
+        const val ACTIVITY_THRESHOLD_SECONDS = 3
+        const val CPU_RUNNING_THRESHOLD = 5.0
+        const val TAIL_BUFFER_BYTES = 8 * 1024
+        const val MAX_PROCESS_TREE_DEPTH = 15
+        const val ENV_CACHE_TTL_MS = 30_000L       // environment detection cache: 30s
+        const val JSONL_CACHE_TTL_MS = 10_000L     // null-result JSONL file lookup cache: 10s
+
+        /** Estimated JSONL file size for a full 200K token context (~2MB with JSON overhead). */
+        const val ESTIMATED_FULL_CONTEXT_BYTES = 2_000_000L
+
+        private val JETBRAINS_NAMES = listOf(
+            "idea", "phpstorm", "webstorm", "pycharm", "rubymine",
+            "goland", "clion", "rider", "datagrip", "appcode", "fleet",
+            "intellij", "android-studio", "studio"
+        )
+
         fun getInstance(): ClaudeSessionMonitorService =
             ApplicationManager.getApplication().getService(ClaudeSessionMonitorService::class.java)
     }
