@@ -3,7 +3,8 @@ export JAVA_HOME
 export PATH := $(JAVA_HOME)/bin:$(PATH)
 
 GRADLEW := ./gradlew
-PLUGIN_ZIP := build/distributions/claude-code-sessions-1.0.0.zip
+PLUGIN_VERSION := $(shell grep '^pluginVersion=' gradle.properties | cut -d= -f2)
+PLUGIN_ZIP := build/distributions/claude-code-sessions-$(PLUGIN_VERSION).zip
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Targets
