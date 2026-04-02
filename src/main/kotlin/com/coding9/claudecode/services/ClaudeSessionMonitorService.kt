@@ -14,6 +14,8 @@ import com.intellij.openapi.diagnostic.thisLogger
 import com.intellij.openapi.Disposable
 import java.io.File
 import java.io.RandomAccessFile
+import java.nio.file.Files
+import java.nio.file.attribute.BasicFileAttributes
 import java.time.Instant
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
@@ -409,8 +411,86 @@ class ClaudeSessionMonitorService : Disposable {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Session history — scan JSONL files for past sessions
+    // ------------------------------------------------------------------
+
+    fun loadHistorySessions(): List<ClaudeSession> {
+        val projectsDir = File(System.getProperty("user.home"), ".claude/projects")
+        if (!projectsDir.isDirectory) return emptyList()
+
+        val activeSessionIds = sessions.map { it.sessionId }.toSet()
+        val historySessions = mutableListOf<ClaudeSession>()
+
+        projectsDir.listFiles { f -> f.isDirectory }?.forEach { projectDir ->
+            val jsonlFiles = projectDir.listFiles { f -> f.extension == "jsonl" } ?: return@forEach
+
+            for (jsonlFile in jsonlFiles) {
+                val sessionId = jsonlFile.nameWithoutExtension
+                if (sessionId in activeSessionIds) continue
+                if (jsonlFile.length() == 0L) continue
+
+                val cwd = decodeProjectPath(projectDir.name)
+                val lastModified = jsonlFile.lastModified()
+                val startedAt = try {
+                    val attrs = Files.readAttributes(jsonlFile.toPath(), BasicFileAttributes::class.java)
+                    attrs.creationTime().toMillis()
+                } catch (_: Exception) { lastModified }
+
+                val fileSize = jsonlFile.length()
+                val lineCount = countFileLines(jsonlFile)
+                val tailLines = readTailLines(jsonlFile)
+                val lastMessage = extractLastAssistantSnippet(tailLines)
+
+                historySessions.add(ClaudeSession(
+                    pid = 0L,
+                    sessionId = sessionId,
+                    cwd = cwd,
+                    startedAt = startedAt,
+                    state = SessionState.FINISHED,
+                    lastActivityAt = Instant.ofEpochMilli(lastModified),
+                    lastAssistantMessage = lastMessage,
+                    contextBytes = fileSize,
+                    turnCount = lineCount
+                ))
+            }
+        }
+
+        return historySessions.sortedByDescending { it.lastActivityAt }.take(MAX_HISTORY_SESSIONS)
+    }
+
+    /**
+     * Decode an encoded project directory name back to a filesystem path.
+     * The encoding is `cwd.replace("/", "-")`, so `/Users/alex/Work/proj` becomes `-Users-alex-Work-proj`.
+     * We walk the filesystem to handle directory names that contain dashes.
+     */
+    private fun decodeProjectPath(encoded: String): String {
+        val parts = encoded.trimStart('-').split("-")
+        if (parts.isEmpty()) return encoded
+        return tryReconstructPath(parts, "", 0) ?: ("/" + parts.joinToString("/"))
+    }
+
+    private fun tryReconstructPath(parts: List<String>, current: String, idx: Int): String? {
+        if (idx >= parts.size) return current
+        // Try longest match first to handle dashes in directory names
+        for (end in parts.size downTo idx + 1) {
+            val segment = parts.subList(idx, end).joinToString("-")
+            val candidate = "$current/$segment"
+            if (end == parts.size) {
+                // Last segment(s) — accept if parent exists or if full path exists
+                val parentExists = current.isEmpty() || File(current).isDirectory
+                if (parentExists) return candidate
+            } else if (File(candidate).isDirectory) {
+                val result = tryReconstructPath(parts, candidate, end)
+                if (result != null) return result
+            }
+        }
+        return null
+    }
+
     companion object {
         const val POLL_INTERVAL_SECONDS = 2L
+        const val MAX_HISTORY_SESSIONS = 200
         const val ACTIVITY_THRESHOLD_SECONDS = 3
         const val CPU_RUNNING_THRESHOLD = 5.0
         const val TAIL_BUFFER_BYTES = 8 * 1024
