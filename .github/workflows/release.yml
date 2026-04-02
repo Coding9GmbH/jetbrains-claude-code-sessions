@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build plugin
+        run: ./gradlew buildPlugin
+
+      - name: Verify plugin
+        run: ./gradlew verifyPlugin
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Claude Code Sessions ${{ github.ref_name }}
+          body: |
+            ## Installation
+
+            1. Download `claude-code-sessions-${{ steps.version.outputs.VERSION }}.zip` below
+            2. In your JetBrains IDE: **Settings → Plugins → ⚙️ → Install Plugin from Disk...**
+            3. Select the downloaded `.zip` file
+            4. Restart the IDE
+
+            **Requires** JetBrains IDE 2024.3 or newer.
+          files: build/distributions/*.zip
+          generate_release_notes: true

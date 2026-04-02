@@ -11,6 +11,9 @@ build/
 *.iml
 out/
 
+# IntelliJ Platform
+.intellijPlatform/
+
 # OS
 .DS_Store
 Thumbs.db
