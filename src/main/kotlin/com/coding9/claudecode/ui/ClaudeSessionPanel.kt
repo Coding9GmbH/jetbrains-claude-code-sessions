@@ -117,7 +117,7 @@ class ClaudeSessionPanel(private val project: Project, parentDisposable: Disposa
             columnModel.getColumn(COL_ACTION).cellRenderer = ActionButtonRenderer()
 
             // Default sort: state priority ascending
-            rowSorter.sortKeys = listOf(RowSorter.SortKey(COL_STATUS, SortOrder.ASCENDING))
+            this@ClaudeSessionPanel.rowSorter.sortKeys = listOf(RowSorter.SortKey(COL_STATUS, SortOrder.ASCENDING))
 
             // Mouse listener for clicks and hover
             addMouseListener(object : MouseAdapter() {
