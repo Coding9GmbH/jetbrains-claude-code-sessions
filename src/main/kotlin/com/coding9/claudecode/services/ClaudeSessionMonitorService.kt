@@ -62,6 +62,10 @@ class ClaudeSessionMonitorService : Disposable {
     var sessions: List<ClaudeSession> = emptyList()
         private set
 
+    // Only active (running) sessions — used internally by loadHistorySessions() to exclude them
+    // Accessed only from the executor thread
+    private var activeSessions: List<ClaudeSession> = emptyList()
+
     // ------------------------------------------------------------------
     // Lifecycle
     // ------------------------------------------------------------------
@@ -103,17 +107,20 @@ class ClaudeSessionMonitorService : Disposable {
 
     private fun poll() {
         val fresh = loadSessions()
-        sessions = fresh
-        detectStateChanges(fresh)
+        activeSessions = fresh
+        val history = loadHistorySessions()
+        val combined = fresh + history
+        sessions = combined
+        detectStateChanges(combined)
 
         // Evict cache entries for PIDs/sessions that no longer exist
         val activePids = fresh.map { it.pid }.toSet()
-        val activeSessionIds = fresh.map { it.sessionId }.toSet()
+        val allSessionIds = combined.map { it.sessionId }.toSet()
         environmentCache.keys.removeAll { it !in activePids }
-        jsonlFileCache.keys.removeAll { it !in activeSessionIds }
+        jsonlFileCache.keys.removeAll { it !in allSessionIds }
 
         ApplicationManager.getApplication().invokeLater {
-            listeners.forEach { it.onSessions(fresh) }
+            listeners.forEach { it.onSessions(combined) }
         }
     }
 
@@ -246,7 +253,8 @@ class ClaudeSessionMonitorService : Disposable {
             val entry = gson.fromJson(lastLine, JsonObject::class.java)
             val message = entry.getAsJsonObject("message") ?: return SessionState.WAITING_FOR_INPUT
             val role = message.get("role")?.asString
-            val content = message.getAsJsonArray("content")
+            val contentElement = message.get("content")
+            val content = if (contentElement?.isJsonArray == true) contentElement.asJsonArray else null
             when {
                 role == "assistant" -> {
                     val hasToolUse = content?.any { it.asJsonObject?.get("type")?.asString == "tool_use" } ?: false
@@ -419,7 +427,7 @@ class ClaudeSessionMonitorService : Disposable {
         val projectsDir = File(System.getProperty("user.home"), ".claude/projects")
         if (!projectsDir.isDirectory) return emptyList()
 
-        val activeSessionIds = sessions.map { it.sessionId }.toSet()
+        val activeSessionIds = activeSessions.map { it.sessionId }.toSet()
         val historySessions = mutableListOf<ClaudeSession>()
 
         projectsDir.listFiles { f -> f.isDirectory }?.forEach { projectDir ->

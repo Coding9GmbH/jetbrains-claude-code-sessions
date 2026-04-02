@@ -1,6 +1,7 @@
 package com.coding9.claudecode.actions
 
 import com.coding9.claudecode.model.ClaudeSession
+import com.coding9.claudecode.model.SessionEnvironment
 import com.coding9.claudecode.model.SessionState
 import com.intellij.icons.AllIcons
 import com.intellij.notification.NotificationGroupManager
@@ -46,7 +47,8 @@ object OpenSessionAction {
         }
 
         // --- Step 1: focus the real terminal window (iTerm2 / Terminal.app) ---
-        if (IS_MAC && focusExternalTerminal(session)) return
+        // Skip if we already know it's running inside the IDE's built-in terminal
+        if (IS_MAC && session.environment != SessionEnvironment.JETBRAINS_TERMINAL && focusExternalTerminal(session)) return
 
         // --- Step 2: maybe it's running inside the IDE's built-in terminal ---
         val openProject = findOpenProject(session.cwd)
@@ -457,52 +459,110 @@ object OpenSessionAction {
         toolWindow: com.intellij.openapi.wm.ToolWindow,
         targetPid: Long
     ) {
+        // Get the TTY of the Claude process and all sibling PIDs on that TTY.
+        // This is more reliable than trying to match the exact PID via reflection,
+        // because the terminal tab owns the shell process (Claude's parent), not Claude itself.
+        val tty = getProcessTty(targetPid)
+        val ttyPids: Set<Long> = if (tty != null) getPidsOnTty(tty) else emptySet()
+        val shellPid = ProcessHandle.of(targetPid).flatMap { it.parent() }.map { it.pid() }.orElse(-1L)
+
         val contentManager = toolWindow.contentManager
-        val tabCount = contentManager.contentCount
-
-        for (i in 0 until tabCount) {
+        for (i in 0 until contentManager.contentCount) {
             val content = contentManager.getContent(i) ?: continue
-            val component = content.component
-            val shellPid = extractShellPid(component) ?: continue
-
-            if (isClaudeSession(shellPid, targetPid)) {
+            val tabPid = extractAnyPid(content.component) ?: continue
+            if (tabPid == targetPid || tabPid == shellPid || tabPid in ttyPids) {
                 contentManager.setSelectedContent(content, true)
                 return
             }
         }
     }
 
-    private fun extractShellPid(component: java.awt.Component): Long? {
+    /** Return all PIDs running on the given tty (e.g. "s002"). */
+    private fun getPidsOnTty(tty: String): Set<Long> {
         return try {
-            var current: Any? = component
-            for (depth in 0..5) {
-                if (current == null) break
-                val pidField = current.javaClass.declaredFields.firstOrNull { f ->
-                    f.name.contains("pid", ignoreCase = true) && f.type == Long::class.javaPrimitiveType
-                }
-                if (pidField != null) {
-                    pidField.isAccessible = true
-                    return pidField.getLong(current)
-                }
-                current = current.javaClass.declaredFields.firstOrNull()?.let { f ->
-                    f.isAccessible = true
-                    f.get(current)
-                }
-            }
-            null
-        } catch (_: Exception) { null }
-    }
-
-    private fun isClaudeSession(shellPid: Long, claudePid: Long): Boolean {
-        if (shellPid == claudePid) return true
-        return try {
-            val process = ProcessBuilder("pgrep", "-P", shellPid.toString()).start()
+            val devTty = if (tty.startsWith("/dev/")) tty else "/dev/$tty"
+            val process = ProcessBuilder("ps", "-t", devTty, "-o", "pid=").start()
             val output = process.inputStream.bufferedReader().use { it.readText() }
             process.waitFor(3, TimeUnit.SECONDS)
-            output.lines().mapNotNull { it.trim().toLongOrNull() }.any { childPid ->
-                childPid == claudePid || isClaudeSession(childPid, claudePid)
+            output.lines().mapNotNull { it.trim().toLongOrNull() }.toSet()
+        } catch (_: Exception) { emptySet() }
+    }
+
+    /**
+     * Walk the component tree and its object fields (breadth-first, bounded depth)
+     * looking for anything that looks like a process PID.
+     * Tries: getPid() method, Process.pid(), Long fields with pid-like names,
+     * and recursion into Process/Handler/Connector fields.
+     */
+    private fun extractAnyPid(root: java.awt.Component): Long? {
+        val visited = HashSet<Int>()  // identity hash codes to avoid cycles
+        return findPidInObject(root, 0, visited)
+    }
+
+    private fun findPidInObject(obj: Any?, depth: Int, visited: MutableSet<Int>): Long? {
+        if (obj == null || depth > 8) return null
+        if (!visited.add(System.identityHashCode(obj))) return null
+
+        val cls = obj.javaClass
+
+        // Strategy 1: If it's a java.lang.Process, call .pid() (Java 9+)
+        if (obj is Process) {
+            try { val p = obj.pid(); if (p > 0) return p } catch (_: Exception) {}
+        }
+
+        // Strategy 2: Look for a getPid() / pid() method returning long
+        for (methodName in listOf("getPid", "pid", "getShellPid")) {
+            try {
+                val m = cls.methods.firstOrNull { it.name == methodName && it.parameterCount == 0
+                        && (it.returnType == Long::class.javaPrimitiveType || it.returnType == Long::class.javaObjectType) }
+                if (m != null) {
+                    val v = m.invoke(obj)
+                    val pid = (v as? Long) ?: (v as? Number)?.toLong()
+                    if (pid != null && pid > 0) return pid
+                }
+            } catch (_: Exception) {}
+        }
+
+        // Collect all declared fields across the class hierarchy
+        val allFields = generateSequence(cls as Class<*>?) { it.superclass }
+            .takeWhile { it != Any::class.java }
+            .flatMap { it.declaredFields.asSequence() }
+            .toList()
+
+        // Strategy 3: Long fields with pid-like names
+        for (field in allFields) {
+            val name = field.name.lowercase()
+            if (!name.contains("pid") && name != "shellpid") continue
+            if (field.type != Long::class.javaPrimitiveType && field.type != Long::class.javaObjectType) continue
+            field.isAccessible = true
+            try {
+                val v = if (field.type == Long::class.javaPrimitiveType) field.getLong(obj) else field.get(obj) as? Long ?: continue
+                if (v > 0) return v
+            } catch (_: Exception) {}
+        }
+
+        // Strategy 4: Recurse into Process / Handler / Connector / Runner fields
+        for (field in allFields) {
+            val typeName = field.type.name
+            if (!typeName.contains("Process") && !typeName.contains("Handler")
+                && !typeName.contains("Connector") && !typeName.contains("Runner")) continue
+            field.isAccessible = true
+            try {
+                val v = field.get(obj) ?: continue
+                val result = findPidInObject(v, depth + 1, visited)
+                if (result != null) return result
+            } catch (_: Exception) {}
+        }
+
+        // Strategy 5: Recurse into AWT component children (shallow)
+        if (obj is java.awt.Container && depth < 4) {
+            for (child in obj.components) {
+                val result = findPidInObject(child, depth + 1, visited)
+                if (result != null) return result
             }
-        } catch (_: Exception) { false }
+        }
+
+        return null
     }
 
     // =========================================================================
