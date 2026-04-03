@@ -459,9 +459,6 @@ object OpenSessionAction {
         toolWindow: com.intellij.openapi.wm.ToolWindow,
         targetPid: Long
     ) {
-        // Get the TTY of the Claude process and all sibling PIDs on that TTY.
-        // This is more reliable than trying to match the exact PID via reflection,
-        // because the terminal tab owns the shell process (Claude's parent), not Claude itself.
         val tty = getProcessTty(targetPid)
         val ttyPids: Set<Long> = if (tty != null) getPidsOnTty(tty) else emptySet()
         val shellPid = ProcessHandle.of(targetPid).flatMap { it.parent() }.map { it.pid() }.orElse(-1L)
@@ -469,23 +466,109 @@ object OpenSessionAction {
         val contentManager = toolWindow.contentManager
         for (i in 0 until contentManager.contentCount) {
             val content = contentManager.getContent(i) ?: continue
-            val tabPid = extractAnyPid(content.component) ?: continue
+            val tabPid = extractTerminalPid(content.component) ?: continue
             if (tabPid == targetPid || tabPid == shellPid || tabPid in ttyPids) {
                 contentManager.setSelectedContent(content, true)
                 return
             }
+            // TTY fallback: compare the tab's process tty with Claude's tty
+            if (tty != null) {
+                val tabTty = getProcessTty(tabPid)
+                if (tabTty != null && normalizeTty(tabTty) == normalizeTty(tty)) {
+                    contentManager.setSelectedContent(content, true)
+                    return
+                }
+            }
         }
     }
 
-    /** Return all PIDs running on the given tty (e.g. "s002"). */
+    /**
+     * Normalize a tty string to a short comparable form.
+     * Examples: "/dev/ttys002" → "s002", "ttys002" → "s002", "s002" → "s002"
+     */
+    private fun normalizeTty(tty: String): String =
+        tty.removePrefix("/dev/tty").removePrefix("/dev/").removePrefix("tty").lowercase()
+
+    /**
+     * Return all PIDs running on the given tty (e.g. "s002" or "/dev/ttys002").
+     * Handles macOS short tty names: "s002" → "/dev/ttys002"
+     */
     private fun getPidsOnTty(tty: String): Set<Long> {
         return try {
-            val devTty = if (tty.startsWith("/dev/")) tty else "/dev/$tty"
+            val short = normalizeTty(tty)
+            val devTty = "/dev/tty$short"   // s002 → /dev/ttys002
             val process = ProcessBuilder("ps", "-t", devTty, "-o", "pid=").start()
             val output = process.inputStream.bufferedReader().use { it.readText() }
             process.waitFor(3, TimeUnit.SECONDS)
             output.lines().mapNotNull { it.trim().toLongOrNull() }.toSet()
         } catch (_: Exception) { emptySet() }
+    }
+
+    /**
+     * Extract the shell PID from a terminal tab component.
+     * First tries the JetBrains Terminal API (getTtyConnector → getProcess → pid()),
+     * then falls back to a generic reflection walk.
+     */
+    private fun extractTerminalPid(component: java.awt.Component): Long? {
+        // Strategy 1: JetBrains Terminal plugin API
+        // JBTerminalWidget.getTtyConnector() → ProcessTtyConnector.getProcess() → Process.pid()
+        val pid = findPidViaTtyConnector(component, 0, HashSet())
+        if (pid != null) return pid
+
+        // Strategy 2: generic reflection walk (fallback)
+        return extractAnyPid(component)
+    }
+
+    /**
+     * Walk the component/object tree looking for a getTtyConnector() method,
+     * then extract the underlying Process PID from it.
+     */
+    private fun findPidViaTtyConnector(obj: Any?, depth: Int, visited: MutableSet<Int>): Long? {
+        if (obj == null || depth > 6) return null
+        if (!visited.add(System.identityHashCode(obj))) return null
+
+        // Try getTtyConnector() → getProcess() → pid()
+        try {
+            val connMethod = obj.javaClass.methods.firstOrNull {
+                it.name == "getTtyConnector" && it.parameterCount == 0
+            }
+            if (connMethod != null) {
+                val connector = connMethod.invoke(obj)
+                if (connector != null) {
+                    // getProcess() → java.lang.Process.pid()
+                    val procMethod = connector.javaClass.methods.firstOrNull {
+                        it.name == "getProcess" && it.parameterCount == 0
+                    }
+                    if (procMethod != null) {
+                        val proc = procMethod.invoke(connector)
+                        if (proc is Process) {
+                            try { val p = proc.pid(); if (p > 0) return p } catch (_: Exception) {}
+                        }
+                    }
+                    // Direct pid() / getPid() on connector as fallback
+                    for (name in listOf("getPid", "pid")) {
+                        try {
+                            val m = connector.javaClass.methods.firstOrNull {
+                                it.name == name && it.parameterCount == 0
+                            } ?: continue
+                            val v = m.invoke(connector)
+                            val p = (v as? Long) ?: (v as? Number)?.toLong()
+                            if (p != null && p > 0) return p
+                        } catch (_: Exception) {}
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+
+        // Recurse into AWT children
+        if (obj is java.awt.Container && depth < 4) {
+            for (child in obj.components) {
+                val result = findPidViaTtyConnector(child, depth + 1, visited)
+                if (result != null) return result
+            }
+        }
+
+        return null
     }
 
     /**

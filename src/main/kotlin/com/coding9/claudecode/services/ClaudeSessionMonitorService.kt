@@ -202,9 +202,17 @@ class ClaudeSessionMonitorService : Disposable {
         // Read tail lines once and reuse for both state detection and last message
         val tailLines = if (jsonlFile != null) readTailLines(jsonlFile) else emptyList()
 
+        val waitState = determineWaitState(tailLines)
+        // Tools (bash, file ops, etc.) can run for tens of seconds without writing to the JSONL.
+        // Use a longer inactivity threshold before declaring WAITING_FOR_ACCEPT, so we don't
+        // falsely show "Accept needed" while the tool is still executing.
+        val threshold = if (waitState == SessionState.WAITING_FOR_ACCEPT)
+            TOOL_RUNNING_THRESHOLD_SECONDS
+        else
+            ACTIVITY_THRESHOLD_SECONDS
         session.state = when {
-            secondsSinceActivity < ACTIVITY_THRESHOLD_SECONDS || session.cpuPercent > CPU_RUNNING_THRESHOLD -> SessionState.RUNNING
-            else -> determineWaitState(tailLines)
+            secondsSinceActivity < threshold || session.cpuPercent > CPU_RUNNING_THRESHOLD -> SessionState.RUNNING
+            else -> waitState
         }
 
         session.lastAssistantMessage = extractLastAssistantSnippet(tailLines)
@@ -527,6 +535,7 @@ class ClaudeSessionMonitorService : Disposable {
         const val POLL_INTERVAL_SECONDS = 2L
         const val MAX_HISTORY_SESSIONS = 200
         const val ACTIVITY_THRESHOLD_SECONDS = 3
+        const val TOOL_RUNNING_THRESHOLD_SECONDS = 30  // tools can run for 30s+ without JSONL writes
         const val CPU_RUNNING_THRESHOLD = 5.0
         const val TAIL_BUFFER_BYTES = 8 * 1024
         const val MAX_PROCESS_TREE_DEPTH = 15
