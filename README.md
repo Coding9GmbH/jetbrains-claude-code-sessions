@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/Coding9GmbH/jetbrains-claude-code-sessions/releases/latest"><img src="https://img.shields.io/github/v/release/Coding9GmbH/jetbrains-claude-code-sessions?style=flat-square&color=blue" alt="Latest Release"></a>
-  <a href="https://github.com/Coding9GmbH/jetbrains-claude-code-sessions/actions/workflows/build.yml"><img src="https://img.shields.io/github/actions/workflow/status/Coding9GmbH/jetbrains-claude-code-sessions/build.yml?style=flat-square" alt="Build"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License"></a>
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey?style=flat-square" alt="Platform">
   <img src="https://img.shields.io/badge/IDE-2024.3%2B-orange?style=flat-square" alt="IDE Version">
 </p>
@@ -25,7 +25,7 @@ Never lose track of your Claude Code sessions again. This plugin adds a **Claude
 - **Smart status detection** — Running, Waiting for Input, Waiting for Accept, Finished
 - **Environment detection** — see whether a session runs in your JetBrains terminal or an external terminal
 - **CPU usage tracking** — per-session CPU percentage at a glance
-- **Context usage indicator** — visual progress bar showing how much context window is used
+- **Context usage indicator** — visual progress bar showing how much of the context window is used
 - **One-click actions** — open projects, focus terminals, resume finished sessions
 - **Session history** — browse and resume past sessions
 - **Search & filter** — find sessions by name, path, or status
@@ -69,7 +69,20 @@ The plugin ZIP will be at `build/distributions/claude-code-sessions-*.zip`.
 
 ## How It Works
 
-The plugin monitors `~/.claude/sessions/` for session files created by the Claude Code CLI. It reads session metadata, tracks process state, and parses conversation files to determine the current status of each session. No data is sent anywhere — everything stays local.
+The plugin monitors `~/.claude/sessions/` for session files created by the Claude Code CLI. It reads session metadata, tracks process state, and parses conversation files to determine the current status of each session.
+
+**Everything stays local** — no data is sent anywhere, no external APIs are called, no telemetry.
+
+### Architecture
+
+```
+~/.claude/sessions/
+    └── <project-hash>/
+        ├── session.json        ← metadata (PID, session ID, working directory)
+        └── conversation.jsonl  ← parsed for status detection & context usage
+```
+
+The plugin reads these files every 2 seconds, checks if the associated process is still alive via the Java `ProcessHandle` API, and determines the session state by analyzing the last entries in the conversation log.
 
 ## Compatibility
 
@@ -84,6 +97,9 @@ Contributions are welcome! Feel free to open issues or submit pull requests.
 ```bash
 # Run a sandboxed IDE instance with the plugin loaded
 ./gradlew runIde
+
+# Build the plugin
+./gradlew buildPlugin
 
 # Run the IntelliJ plugin verifier
 ./gradlew verifyPlugin
