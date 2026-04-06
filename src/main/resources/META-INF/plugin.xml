@@ -1,0 +1,92 @@
+<idea-plugin>
+    <id>com.coding9.claude-code-sessions</id>
+    <name>Claude Code Sessions</name>
+    <vendor email="info@coding9.de" url="https://coding9.de">coding9</vendor>
+
+    <description><![CDATA[
+        Monitor and manage all running Claude Code CLI sessions directly from your JetBrains IDE.<br>
+        <ul>
+            <li>See all active Claude sessions across all projects</li>
+            <li>Status indicators: Running, Waiting for Input, Waiting for Accept, Finished</li>
+            <li>Environment detection: shows whether sessions run in JetBrains or external terminal</li>
+            <li>Live CPU usage per session</li>
+            <li>Click to open the project or focus the terminal</li>
+            <li>Resume finished sessions in Terminal or JetBrains IDE</li>
+            <li>Search/filter sessions by name, path, or status</li>
+            <li>Sortable columns for easy session management</li>
+            <li>Desktop notifications when a session needs your attention</li>
+            <li>Cross-platform: macOS, Linux, Windows</li>
+        </ul>
+        <b>Keyboard shortcuts:</b>
+        <ul>
+            <li>Enter – Open/Resume selected session</li>
+            <li>F5 – Refresh sessions</li>
+            <li>Ctrl+F / Cmd+F – Focus search field</li>
+            <li>Delete – Kill selected session</li>
+            <li>Escape – Clear search</li>
+        </ul>
+    ]]></description>
+
+    <change-notes><![CDATA[
+        <b>1.1.0</b>
+        <ul>
+            <li>Session environment detection (JetBrains vs Terminal)</li>
+            <li>Resume finished sessions with Terminal/JetBrains IDE choice</li>
+            <li>CPU usage column</li>
+            <li>Session search/filter</li>
+            <li>Sortable table columns</li>
+            <li>Keyboard shortcuts (Enter, F5, Ctrl+F, Delete)</li>
+            <li>Cross-platform support (Linux, Windows)</li>
+            <li>Fixed ProcessBuilder stream leaks</li>
+            <li>Optimized file I/O (single tail read per poll cycle)</li>
+        </ul>
+        <b>1.0.0</b>
+        <ul>
+            <li>Initial release</li>
+        </ul>
+    ]]></change-notes>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends optional="true" config-file="terminal-features.xml">org.jetbrains.plugins.terminal</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <!-- Application-level service that monitors all Claude sessions -->
+        <applicationService
+                serviceImplementation="com.coding9.claudecode.services.ClaudeSessionMonitorService"/>
+
+        <!-- Auto-start the monitor when the IDE is ready -->
+        <applicationListener
+                implementation="com.coding9.claudecode.ClaudeCodeAppLifecycle"
+                topic="com.intellij.ide.AppLifecycleListener"/>
+
+        <!-- Tool Window: shows the session list -->
+        <toolWindow
+                id="Claude Sessions"
+                anchor="bottom"
+                factoryClass="com.coding9.claudecode.ui.ClaudeToolWindowFactory"
+                icon="/icons/claude_13.svg"
+                canCloseContents="false"/>
+
+        <!-- Notifications group -->
+        <notificationGroup
+                id="Claude Code Sessions"
+                displayType="BALLOON"
+                isLogByDefault="true"/>
+    </extensions>
+
+    <actions>
+        <group id="ClaudeCode.ToolbarActions" text="Claude Code" popup="false">
+            <action id="ClaudeCode.Refresh"
+                    class="com.coding9.claudecode.actions.RefreshAction"
+                    text="Refresh Sessions"
+                    description="Refresh the list of Claude Code sessions"
+                    icon="AllIcons.Actions.Refresh"/>
+            <separator/>
+            <action id="ClaudeCode.StartSession"
+                    class="com.coding9.claudecode.actions.StartSessionAction"
+                    text="Start Claude in Current Project"
+                    description="Start a new Claude Code session in the current project directory"
+                    icon="AllIcons.Actions.Execute"/>
+        </group>
+    </actions>
+</idea-plugin>
