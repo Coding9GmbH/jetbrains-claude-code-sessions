@@ -28,6 +28,10 @@
     ]]></description>
 
     <change-notes><![CDATA[
+        <b>1.2.0</b>
+        <ul>
+            <li>Extended IDE compatibility: now supports JetBrains IDEs from 2023.3 onwards</li>
+        </ul>
         <b>1.1.0</b>
         <ul>
             <li>Session environment detection (JetBrains vs Terminal)</li>

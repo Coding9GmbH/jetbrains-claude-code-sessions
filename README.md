@@ -12,7 +12,7 @@
   <a href="https://github.com/Coding9GmbH/jetbrains-claude-code-sessions/releases/latest"><img src="https://img.shields.io/github/v/release/Coding9GmbH/jetbrains-claude-code-sessions?style=flat-square&color=blue" alt="Latest Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License"></a>
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey?style=flat-square" alt="Platform">
-  <img src="https://img.shields.io/badge/IDE-2024.3%2B-orange?style=flat-square" alt="IDE Version">
+  <img src="https://img.shields.io/badge/IDE-2023.3%2B-orange?style=flat-square" alt="IDE Version">
 </p>
 
 ---
@@ -26,7 +26,7 @@
 3. Wähle die heruntergeladene `.zip`-Datei aus
 4. IDE neu starten — fertig
 
-> **Voraussetzungen:** JetBrains IDE 2024.3+ und [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) im PATH
+> **Voraussetzungen:** JetBrains IDE 2023.3+ und [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) im PATH
 
 ### Option 2 — Aus dem Quellcode bauen
 
@@ -44,6 +44,15 @@ Dann wie in Option 1 ab Schritt 2 fortfahren.
 Never lose track of your Claude Code sessions again. This plugin adds a **Claude Sessions** tool window to your JetBrains IDE that shows every running, waiting, and finished session across all your projects — with live status updates, CPU monitoring, and one-click actions.
 
 ## Features
+
+### Session Status
+
+| Status | Description |
+|--------|-------------|
+| 🟢 Running | Claude is actively processing |
+| 🟡 Waiting for Input | Claude is waiting for your response |
+| 🟠 Waiting for Accept | Claude needs you to approve a file change |
+| ⚫ Finished | Session has ended |
 
 - **Live session monitoring** — polls every 2 seconds, shows all active Claude sessions across all projects
 - **Smart status detection** — Running, Waiting for Input, Waiting for Accept, Finished
@@ -69,7 +78,7 @@ Never lose track of your Claude Code sessions again. This plugin adds a **Claude
 
 ## Requirements
 
-- JetBrains IDE **2024.3** or newer (IntelliJ IDEA, WebStorm, PhpStorm, PyCharm, etc.)
+- JetBrains IDE **2023.3** or newer (IntelliJ IDEA, WebStorm, PhpStorm, PyCharm, etc.)
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and available in your PATH
 
 ## How It Works
@@ -91,9 +100,23 @@ The plugin reads these files every 2 seconds, checks if the associated process i
 
 ## Compatibility
 
-Works with all JetBrains IDEs based on the IntelliJ Platform (2024.3+):
+Works with all JetBrains IDEs based on the IntelliJ Platform (2023.3+):
 
 IntelliJ IDEA · WebStorm · PhpStorm · PyCharm · GoLand · RubyMine · CLion · Rider · Android Studio · DataGrip · RustRover
+
+## FAQ
+
+**The plugin shows no sessions — what's wrong?**
+Make sure the Claude Code CLI is installed and has been run at least once. The plugin reads from `~/.claude/sessions/`, which is created automatically by the CLI.
+
+**Does this plugin send any data externally?**
+No. Everything is read locally from `~/.claude/sessions/`. No analytics, no telemetry, no network requests.
+
+**Which IDEs are supported?**
+All JetBrains IDEs based on the IntelliJ Platform 2023.3 or newer: IntelliJ IDEA, WebStorm, PhpStorm, PyCharm, GoLand, RubyMine, CLion, Rider, Android Studio, DataGrip, RustRover.
+
+**Why can't I focus a terminal session?**
+Focusing an existing terminal tab requires the JetBrains Terminal plugin (bundled by default). If it's disabled, the plugin will open a new terminal instead.
 
 ## Contributing
 
