@@ -6,8 +6,9 @@
     <description><![CDATA[
         Monitor and manage all running Claude Code CLI sessions directly from your JetBrains IDE.<br>
         <ul>
-            <li>See all active Claude sessions across all projects</li>
-            <li>Status indicators: Running, Waiting for Input, Waiting for Accept, Finished</li>
+            <li>See all active Claude sessions across all projects, with session names and AI titles</li>
+            <li>Status indicators driven by the CLI's own busy/idle state: Running, Waiting for Input, Waiting for Accept, Finished</li>
+            <li>Real context window usage (tokens) and model per session</li>
             <li>Environment detection: shows whether sessions run in JetBrains or external terminal</li>
             <li>Live CPU usage per session</li>
             <li>Click to open the project or focus the terminal</li>
@@ -28,6 +29,17 @@
     ]]></description>
 
     <change-notes><![CDATA[
+        <b>1.3.0</b>
+        <ul>
+            <li>Updated for current Claude Code CLI (2.x): reads the new session registry fields</li>
+            <li>Status detection now uses the CLI's own busy/idle state instead of CPU heuristics</li>
+            <li>Context indicator shows real token usage against the model's context window (200K/1M)</li>
+            <li>Session names and AI-generated titles are displayed instead of just project names</li>
+            <li>New Model column (Fable 5, Opus 4.8, Sonnet 5, Haiku 4.5, ...)</li>
+            <li>Transcript parser updated for the type-discriminated JSONL format (skips meta/subagent lines)</li>
+            <li>"Accept needed" is no longer shown for auto-approved tools (acceptEdits/bypassPermissions)</li>
+            <li>Project path encoding fixed for directories with dots or special characters</li>
+        </ul>
         <b>1.2.0</b>
         <ul>
             <li>Extended IDE compatibility: now supports JetBrains IDEs from 2023.3 onwards</li>

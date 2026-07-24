@@ -49,12 +49,20 @@ class ClaudeSessionMonitorService : Disposable {
     private var lastKnownSessions: Map<Long, SessionState> = emptyMap()
 
     // Caches — accessed only from the single executor thread
-    private data class LineCountEntry(val lastModified: Long, val lineCount: Int)
+    private data class JsonlScan(
+        val lineCount: Int,
+        val title: String,
+        val model: String,
+        val contextTokens: Long,
+        val permissionMode: String
+    )
+    private data class JsonlScanEntry(val lastModified: Long, val scan: JsonlScan)
     private data class EnvironmentEntry(val environment: SessionEnvironment, val timestamp: Long)
     private data class SessionFileEntry(val lastModified: Long, val session: ClaudeSession?)
     private data class JsonlFileEntry(val path: File?, val timestamp: Long)
 
-    private val lineCountCache = HashMap<String, LineCountEntry>()           // filePath -> cached count
+    private val jsonlScanCache = HashMap<String, JsonlScanEntry>()           // filePath -> cached scan
+    private val decodedPathCache = HashMap<String, String>()                  // encoded dir name -> decoded path
     private val environmentCache = HashMap<Long, EnvironmentEntry>()          // pid -> cached env
     private val sessionFileCache = HashMap<String, SessionFileEntry>()        // filePath -> cached parse
     private val jsonlFileCache = HashMap<String, JsonlFileEntry>()            // sessionId -> cached path
@@ -164,7 +172,15 @@ class ClaudeSessionMonitorService : Disposable {
             val sessionId = json.get("sessionId")?.asString ?: return null
             val cwd = json.get("cwd")?.asString ?: return null
             val startedAt = json.get("startedAt")?.asLong ?: 0L
-            ClaudeSession(pid = pid, sessionId = sessionId, cwd = cwd, startedAt = startedAt)
+            ClaudeSession(
+                pid = pid,
+                sessionId = sessionId,
+                cwd = cwd,
+                startedAt = startedAt,
+                name = json.get("name")?.asString ?: "",
+                nativeStatus = json.get("status")?.asString ?: "",
+                cliVersion = json.get("version")?.asString ?: ""
+            )
         } catch (e: Exception) {
             log.warn("Could not parse session file ${file.name}: ${e.message}")
             null
@@ -177,10 +193,11 @@ class ClaudeSessionMonitorService : Disposable {
         val alive = ProcessHandle.of(session.pid).map { it.isAlive }.orElse(false)
         val jsonlFile = findJsonlFile(session)
 
-        // Context usage: file size + fast line count
+        var scan: JsonlScan? = null
         if (jsonlFile != null && jsonlFile.exists()) {
             session.contextBytes = jsonlFile.length()
-            session.turnCount = countFileLines(jsonlFile)
+            scan = scanJsonlFile(jsonlFile)
+            applyScan(session, scan)
         }
 
         if (!alive) {
@@ -202,39 +219,105 @@ class ClaudeSessionMonitorService : Disposable {
         // Read tail lines once and reuse for both state detection and last message
         val tailLines = if (jsonlFile != null) readTailLines(jsonlFile) else emptyList()
 
-        val waitState = determineWaitState(tailLines)
-        // Tools (bash, file ops, etc.) can run for tens of seconds without writing to the JSONL.
-        // Use a longer inactivity threshold before declaring WAITING_FOR_ACCEPT, so we don't
-        // falsely show "Accept needed" while the tool is still executing.
-        val threshold = if (waitState == SessionState.WAITING_FOR_ACCEPT)
-            TOOL_RUNNING_THRESHOLD_SECONDS
-        else
-            ACTIVITY_THRESHOLD_SECONDS
-        session.state = when {
-            secondsSinceActivity < threshold || session.cpuPercent > CPU_RUNNING_THRESHOLD -> SessionState.RUNNING
-            else -> waitState
+        // The CLI (2.x) reports its own busy/idle state in sessions/<pid>.json —
+        // use it directly and only fall back to mtime/CPU heuristics for older CLIs.
+        session.state = when (session.nativeStatus) {
+            "busy" -> SessionState.RUNNING
+            "idle" -> determineWaitState(tailLines, scan?.permissionMode ?: "")
+            else -> {
+                val waitState = determineWaitState(tailLines, scan?.permissionMode ?: "")
+                // Tools (bash, file ops, etc.) can run for tens of seconds without writing to the
+                // JSONL. Use a longer inactivity threshold before declaring WAITING_FOR_ACCEPT,
+                // so we don't falsely show "Accept needed" while the tool is still executing.
+                val threshold = if (waitState == SessionState.WAITING_FOR_ACCEPT)
+                    TOOL_RUNNING_THRESHOLD_SECONDS
+                else
+                    ACTIVITY_THRESHOLD_SECONDS
+                when {
+                    secondsSinceActivity < threshold || session.cpuPercent > CPU_RUNNING_THRESHOLD -> SessionState.RUNNING
+                    else -> waitState
+                }
+            }
         }
 
         session.lastAssistantMessage = extractLastAssistantSnippet(tailLines)
         session.environment = detectEnvironment(session.pid)
     }
 
-    /** Line count cached by file modification time — avoids re-reading the entire file every poll. */
-    private fun countFileLines(file: File): Int {
+    private fun applyScan(session: ClaudeSession, scan: JsonlScan) {
+        session.turnCount = scan.lineCount
+        if (session.title.isEmpty()) session.title = scan.title
+        session.model = scan.model
+        session.contextTokens = scan.contextTokens
+        session.contextWindow = contextWindowFor(scan.model)
+    }
+
+    /** Context window in tokens for a model id. Sonnet 5 and [1m] variants have a 1M window. */
+    private fun contextWindowFor(model: String): Long = when {
+        model.isEmpty() -> 0L
+        model.contains("sonnet-5") || model.contains("[1m]") -> CONTEXT_WINDOW_1M
+        else -> CONTEXT_WINDOW_DEFAULT
+    }
+
+    /**
+     * Single cached pass over the JSONL transcript (invalidated by mtime): counts lines and
+     * collects the latest ai-title, permission mode and the last assistant turn's model/usage.
+     * Lines are pre-filtered with cheap substring checks; only two lines get JSON-parsed.
+     */
+    private fun scanJsonlFile(file: File): JsonlScan {
         val path = file.absolutePath
         val lastMod = file.lastModified()
-        val cached = lineCountCache[path]
-        if (cached != null && cached.lastModified == lastMod) return cached.lineCount
+        val cached = jsonlScanCache[path]
+        if (cached != null && cached.lastModified == lastMod) return cached.scan
 
-        val count = try {
+        var count = 0
+        var lastAssistantLine: String? = null
+        var lastTitleLine: String? = null
+        var lastPermissionLine: String? = null
+        try {
             file.bufferedReader().use { reader ->
-                var c = 0
-                while (reader.readLine() != null) c++
-                c
+                var line = reader.readLine()
+                while (line != null) {
+                    count++
+                    when {
+                        line.contains("\"type\":\"assistant\"") &&
+                            !line.contains("\"isSidechain\":true") -> lastAssistantLine = line
+                        line.contains("\"type\":\"ai-title\"") -> lastTitleLine = line
+                        line.contains("\"type\":\"permission-mode\"") -> lastPermissionLine = line
+                    }
+                    line = reader.readLine()
+                }
             }
-        } catch (_: Exception) { 0 }
-        lineCountCache[path] = LineCountEntry(lastMod, count)
-        return count
+        } catch (_: Exception) { /* partial scan is fine */ }
+
+        var title = ""
+        var model = ""
+        var contextTokens = 0L
+        var permissionMode = ""
+        try {
+            lastTitleLine?.let { title = gson.fromJson(it, JsonObject::class.java).get("aiTitle")?.asString ?: "" }
+        } catch (_: Exception) { }
+        try {
+            lastPermissionLine?.let {
+                permissionMode = gson.fromJson(it, JsonObject::class.java).get("permissionMode")?.asString ?: ""
+            }
+        } catch (_: Exception) { }
+        try {
+            lastAssistantLine?.let { line ->
+                val message = gson.fromJson(line, JsonObject::class.java).getAsJsonObject("message")
+                model = message?.get("model")?.asString ?: ""
+                val usage = message?.getAsJsonObject("usage")
+                if (usage != null) {
+                    contextTokens = (usage.get("input_tokens")?.asLong ?: 0L) +
+                        (usage.get("cache_read_input_tokens")?.asLong ?: 0L) +
+                        (usage.get("cache_creation_input_tokens")?.asLong ?: 0L)
+                }
+            }
+        } catch (_: Exception) { }
+
+        val scan = JsonlScan(count, title, model, contextTokens, permissionMode)
+        jsonlScanCache[path] = JsonlScanEntry(lastMod, scan)
+        return scan
     }
 
     // ------------------------------------------------------------------
@@ -259,46 +342,63 @@ class ClaudeSessionMonitorService : Disposable {
         return String(buffer, Charsets.UTF_8).lines().filter { it.isNotBlank() }
     }
 
-    private fun determineWaitState(tailLines: List<String>): SessionState {
-        val lastLine = tailLines.lastOrNull() ?: return SessionState.WAITING_FOR_INPUT
-        return try {
-            val entry = gson.fromJson(lastLine, JsonObject::class.java)
-            val message = entry.getAsJsonObject("message") ?: return SessionState.WAITING_FOR_INPUT
-            val role = message.get("role")?.asString
-            val contentElement = message.get("content")
-            val content = if (contentElement?.isJsonArray == true) contentElement.asJsonArray else null
-            when {
-                role == "assistant" -> {
-                    val hasToolUse = content?.any { it.asJsonObject?.get("type")?.asString == "tool_use" } ?: false
-                    if (hasToolUse) SessionState.WAITING_FOR_ACCEPT else SessionState.WAITING_FOR_INPUT
-                }
-                role == "user" -> SessionState.RUNNING
-                else -> SessionState.WAITING_FOR_INPUT
+    /**
+     * Determine what an idle session is waiting for by walking the transcript tail backwards
+     * to the last real conversation entry. JSONL lines are type-discriminated (user, assistant,
+     * system, attachment, ai-title, file-history-*, ...) — everything except user/assistant
+     * turns is skipped, as are meta and sidechain (subagent) lines.
+     */
+    private fun determineWaitState(tailLines: List<String>, permissionMode: String): SessionState {
+        for (line in tailLines.asReversed()) {
+            val entry = try {
+                gson.fromJson(line, JsonObject::class.java)
+            } catch (_: JsonSyntaxException) {
+                continue  // first tail line may be cut off mid-JSON
+            } ?: continue
+            val type = entry.get("type")?.asString ?: continue
+            if (type != "user" && type != "assistant") continue
+            if (entry.get("isSidechain")?.asBoolean == true) continue
+            if (entry.get("isMeta")?.asBoolean == true) continue
+            val message = entry.getAsJsonObject("message") ?: continue
+
+            if (type == "user") {
+                // A user turn (prompt or tool_result) means Claude has work to do next
+                return SessionState.RUNNING
             }
-        } catch (e: JsonSyntaxException) {
-            SessionState.WAITING_FOR_INPUT
+
+            val content = message.get("content")?.takeIf { it.isJsonArray }?.asJsonArray
+            val hasToolUse = content?.any {
+                it.isJsonObject && it.asJsonObject.get("type")?.asString == "tool_use"
+            } ?: false
+            // In auto-accepting permission modes a trailing tool_use is not waiting on the user
+            val autoAccepts = permissionMode == "bypassPermissions" || permissionMode == "acceptEdits"
+            return if (hasToolUse && !autoAccepts) SessionState.WAITING_FOR_ACCEPT
+                   else SessionState.WAITING_FOR_INPUT
         }
+        return SessionState.WAITING_FOR_INPUT
     }
 
     private fun extractLastAssistantSnippet(tailLines: List<String>): String {
-        val lastAssistantLine = tailLines.lastOrNull { line ->
-            try {
+        for (line in tailLines.asReversed()) {
+            val entry = try {
                 gson.fromJson(line, JsonObject::class.java)
-                    .getAsJsonObject("message")?.get("role")?.asString == "assistant"
-            } catch (_: Exception) { false }
-        } ?: return ""
+            } catch (_: Exception) {
+                continue
+            } ?: continue
+            if (entry.get("type")?.asString != "assistant") continue
+            if (entry.get("isSidechain")?.asBoolean == true) continue
 
-        return try {
-            val entry = gson.fromJson(lastAssistantLine, JsonObject::class.java)
             val content = entry.getAsJsonObject("message")
-                ?.getAsJsonArray("content")
-                ?.firstOrNull()?.asJsonObject
-            when (content?.get("type")?.asString) {
-                "text" -> content.get("text")?.asString?.takeLast(120)?.trimStart() ?: ""
-                "tool_use" -> "Using tool: ${content.get("name")?.asString ?: "unknown"}"
-                else -> ""
-            }
-        } catch (_: Exception) { "" }
+                ?.get("content")?.takeIf { it.isJsonArray }?.asJsonArray
+                ?.filter { it.isJsonObject }?.map { it.asJsonObject }
+                ?: continue
+            val text = content.lastOrNull { it.get("type")?.asString == "text" }
+                ?.get("text")?.asString
+            if (!text.isNullOrBlank()) return text.takeLast(120).trimStart()
+            val toolUse = content.lastOrNull { it.get("type")?.asString == "tool_use" }
+            if (toolUse != null) return "Using tool: ${toolUse.get("name")?.asString ?: "unknown"}"
+        }
+        return ""
     }
 
     // ------------------------------------------------------------------
@@ -365,8 +465,11 @@ class ClaudeSessionMonitorService : Disposable {
     }
 
     private fun cwdMatchesDir(cwd: String, dirName: String): Boolean {
-        val encoded = cwd.trimEnd('/').replace("/", "-").trimStart('-')
-        return dirName.trimStart('-') == encoded || dirName == cwd.trimEnd('/').replace("/", "-")
+        val encoded = ClaudeSession.encodeProjectPath(cwd)
+        // Also accept the legacy encoding (only slashes replaced) for old project dirs
+        val legacy = cwd.trimEnd('/').replace("/", "-")
+        return dirName == encoded || dirName == legacy ||
+               dirName.trimStart('-') == encoded.trimStart('-')
     }
 
     // ------------------------------------------------------------------
@@ -424,7 +527,7 @@ class ClaudeSessionMonitorService : Disposable {
                 val notification = NotificationGroupManager.getInstance()
                     .getNotificationGroup("Claude Code Sessions")
                     ?.createNotification(
-                        title = session.projectName,
+                        title = session.displayName,
                         content = message,
                         type = type
                     ) ?: return@invokeLater
@@ -480,11 +583,11 @@ class ClaudeSessionMonitorService : Disposable {
                 } catch (_: Exception) { lastModified }
 
                 val fileSize = jsonlFile.length()
-                val lineCount = countFileLines(jsonlFile)
+                val scan = scanJsonlFile(jsonlFile)
                 val tailLines = readTailLines(jsonlFile)
                 val lastMessage = extractLastAssistantSnippet(tailLines)
 
-                historySessions.add(ClaudeSession(
+                val session = ClaudeSession(
                     pid = 0L,
                     sessionId = sessionId,
                     cwd = cwd,
@@ -492,9 +595,10 @@ class ClaudeSessionMonitorService : Disposable {
                     state = SessionState.FINISHED,
                     lastActivityAt = Instant.ofEpochMilli(lastModified),
                     lastAssistantMessage = lastMessage,
-                    contextBytes = fileSize,
-                    turnCount = lineCount
-                ))
+                    contextBytes = fileSize
+                )
+                applyScan(session, scan)
+                historySessions.add(session)
             }
         }
 
@@ -503,32 +607,34 @@ class ClaudeSessionMonitorService : Disposable {
 
     /**
      * Decode an encoded project directory name back to a filesystem path.
-     * The encoding is `cwd.replace("/", "-")`, so `/Users/alex/Work/proj` becomes `-Users-alex-Work-proj`.
-     * We walk the filesystem to handle directory names that contain dashes.
+     * The encoding replaces every non-alphanumeric character with `-`, so
+     * `/Users/alex/Work/my.proj` becomes `-Users-alex-Work-my-proj`. Since that is lossy,
+     * we walk the real filesystem and match directory names by their encoded form
+     * (handles dashes and dots in directory names).
      */
     private fun decodeProjectPath(encoded: String): String {
-        val parts = encoded.trimStart('-').split("-")
-        if (parts.isEmpty()) return encoded
-        return tryReconstructPath(parts, "", 0) ?: ("/" + parts.joinToString("/"))
+        decodedPathCache[encoded]?.let { return it }
+        val target = encoded.trimStart('-')
+        val decoded = matchEncodedPath(File("/"), target)
+            ?: ("/" + target.split("-").joinToString("/"))
+        decodedPathCache[encoded] = decoded
+        return decoded
     }
 
-    private fun tryReconstructPath(parts: List<String>, current: String, idx: Int): String? {
-        if (idx >= parts.size) return current
-        // Try longest match first to handle dashes in directory names
-        for (end in parts.size downTo idx + 1) {
-            val segment = parts.subList(idx, end).joinToString("-")
-            val candidate = "$current/$segment"
-            if (end == parts.size) {
-                // Last segment(s) — only accept if we already have a valid parent directory.
-                // Requiring current.isNotEmpty() prevents greedily accepting the full encoded
-                // string (e.g. "/Users-alex-Work-proj") at the root level.
-                if (current.isNotEmpty() && File(current).isDirectory) return candidate
-            } else if (File(candidate).isDirectory) {
-                val result = tryReconstructPath(parts, candidate, end)
-                if (result != null) return result
+    private fun matchEncodedPath(dir: File, remaining: String): String? {
+        if (remaining.isEmpty()) return dir.absolutePath
+        val entries = dir.listFiles { f -> f.isDirectory } ?: return null
+        // Longest names first so "my-app-v2" wins over "my-app" when both match
+        for (entry in entries.sortedByDescending { it.name.length }) {
+            val enc = entry.name.replace(Regex("[^A-Za-z0-9]"), "-")
+            if (enc.isEmpty()) continue
+            if (remaining == enc) return entry.absolutePath
+            if (remaining.startsWith("$enc-")) {
+                matchEncodedPath(entry, remaining.removePrefix("$enc-"))?.let { return it }
             }
         }
-        return null
+        // Deleted leaf directory: accept the remainder as a single segment under an existing parent
+        return if (!remaining.contains('-')) "${dir.absolutePath.trimEnd('/')}/$remaining" else null
     }
 
     companion object {
@@ -542,7 +648,16 @@ class ClaudeSessionMonitorService : Disposable {
         const val ENV_CACHE_TTL_MS = 30_000L       // environment detection cache: 30s
         const val JSONL_CACHE_TTL_MS = 10_000L     // null-result JSONL file lookup cache: 10s
 
-        /** Estimated JSONL file size for a full 200K token context (~2MB with JSON overhead). */
+        /** Default model context window (tokens). */
+        const val CONTEXT_WINDOW_DEFAULT = 200_000L
+
+        /** 1M context window (Sonnet 5 native, and `[1m]` model variants). */
+        const val CONTEXT_WINDOW_1M = 1_000_000L
+
+        /**
+         * Fallback only (no usage data in the transcript): estimated JSONL file size
+         * for a full 200K token context (~2MB with JSON overhead).
+         */
         const val ESTIMATED_FULL_CONTEXT_BYTES = 2_000_000L
 
         private val JETBRAINS_NAMES = listOf(

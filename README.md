@@ -55,10 +55,12 @@ Never lose track of your Claude Code sessions again. This plugin adds a **Claude
 | ⚫ Finished | Session has ended |
 
 - **Live session monitoring** — polls every 2 seconds, shows all active Claude sessions across all projects
-- **Smart status detection** — Running, Waiting for Input, Waiting for Accept, Finished
+- **Accurate status detection** — driven by the CLI's own busy/idle state: Running, Waiting for Input, Waiting for Accept, Finished
+- **Session names & AI titles** — shows the session name or AI-generated conversation title, not just the project folder
+- **Model column** — see at a glance which model each session uses (Fable 5, Opus 4.8, Sonnet 5, Haiku 4.5, ...)
 - **Environment detection** — see whether a session runs in your JetBrains terminal or an external terminal
 - **CPU usage tracking** — per-session CPU percentage at a glance
-- **Context usage indicator** — visual progress bar showing how much of the context window is used
+- **Context usage indicator** — real token usage from the transcript against the model's context window (200K/1M)
 - **One-click actions** — open projects, focus terminals, resume finished sessions
 - **Session history** — browse and resume past sessions
 - **Search & filter** — find sessions by name, path, or status
@@ -79,24 +81,28 @@ Never lose track of your Claude Code sessions again. This plugin adds a **Claude
 ## Requirements
 
 - JetBrains IDE **2023.3** or newer (IntelliJ IDEA, WebStorm, PhpStorm, PyCharm, etc.)
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and available in your PATH
+- [Claude Code CLI](https://code.claude.com/docs) 2.x installed and available in your PATH (older CLI versions work with reduced accuracy)
 
 ## How It Works
 
-The plugin monitors `~/.claude/sessions/` for session files created by the Claude Code CLI. It reads session metadata, tracks process state, and parses conversation files to determine the current status of each session.
+The plugin reads two data sources maintained by the Claude Code CLI.
 
 **Everything stays local** — no data is sent anywhere, no external APIs are called, no telemetry.
 
 ### Architecture
 
 ```
-~/.claude/sessions/
-    └── <project-hash>/
-        ├── session.json        ← metadata (PID, session ID, working directory)
-        └── conversation.jsonl  ← parsed for status detection & context usage
+~/.claude/
+    ├── sessions/
+    │   └── <pid>.json          ← live process registry: PID, session ID, cwd,
+    │                              session name, and the CLI's own busy/idle status
+    └── projects/
+        └── <encoded-cwd>/
+            └── <session-id>.jsonl  ← conversation transcript: token usage, model,
+                                       AI title, wait-state detection
 ```
 
-The plugin reads these files every 2 seconds, checks if the associated process is still alive via the Java `ProcessHandle` API, and determines the session state by analyzing the last entries in the conversation log.
+The plugin reads these files every 2 seconds, checks if the associated process is still alive via the Java `ProcessHandle` API, and uses the CLI's reported busy/idle status — refined by the last entries in the conversation log — to determine the session state.
 
 ## Compatibility
 
@@ -110,7 +116,7 @@ IntelliJ IDEA · WebStorm · PhpStorm · PyCharm · GoLand · RubyMine · CLion 
 Make sure the Claude Code CLI is installed and has been run at least once. The plugin reads from `~/.claude/sessions/`, which is created automatically by the CLI.
 
 **Does this plugin send any data externally?**
-No. Everything is read locally from `~/.claude/sessions/`. No analytics, no telemetry, no network requests.
+No. Everything is read locally from `~/.claude/sessions/` and `~/.claude/projects/`. No analytics, no telemetry, no network requests.
 
 **Which IDEs are supported?**
 All JetBrains IDEs based on the IntelliJ Platform 2023.3 or newer: IntelliJ IDEA, WebStorm, PhpStorm, PyCharm, GoLand, RubyMine, CLion, Rider, Android Studio, DataGrip, RustRover.

@@ -42,6 +42,12 @@ intellijPlatform {
         }
     }
 
+    pluginVerification {
+        ides {
+            ide(providers.gradleProperty("platformType").get(), providers.gradleProperty("platformVersion").get())
+        }
+    }
+
     signing {
         // configure if you want to sign the plugin
     }
